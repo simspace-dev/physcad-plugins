@@ -1,4 +1,4 @@
-// 3D Deburr (3-axis, version 0.6.0)
+// 3D Deburr (3-axis, version 0.6.1)
 // Finds sharp, outside (convex) edges on the open CAM setup's part that a tool coming down the
 // setup's Z axis can reach, on any kind of surface, checked at points all along each edge. Level
 // edges (a flat top over a vertical wall) get one 2D Chamfer operation; wavy or sloped (3D)

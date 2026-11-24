@@ -1,5 +1,15 @@
 # Changelog
 
+## 3d-deburr 0.6.1 (2026-11-24)
+
+The plugin now has a license. Until now the code was public to read, but nobody else had the legal right to reuse it. It is now under the MIT license, a short, standard license that lets anyone use, change and sell the code as long as the copyright notice stays with it. The reason is practical: PhysCAD's developer has been invited to build 3D deburring into PhysCAD itself using this code, and the license gives him clear, lasting permission to do so.
+
+Nothing about how the plugin works has changed in this version.
+
+- Added `LICENSE` (MIT, copyright 2026 Music City Mfg).
+- `plugin.json` now declares `"license": "MIT"`, which PhysCAD shows in its plugin list.
+- README has a License section.
+
 ## 3d-deburr 0.6.0 (2026-11-24)
 
 3D Deburr now checks every wavy or sloped edge before it cuts it, and only cuts the ones it can do cleanly. Before, it sent every edge it found to a toolpath and hoped. Now it works out how wide the cut would really be at points all along the edge, and leaves an edge out when the width would stray too far from what was asked, when the edge climbs too steeply for the tool's point, when the tool would cut a groove instead of a bevel, or when the tool would run into a wall nearby. Each edge it leaves out is listed with the reason, and a new Show left out button highlights them on the part.

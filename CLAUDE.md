@@ -2,7 +2,7 @@
 
 One folder per plugin. Plugins run in PhysCAD's plugin sandbox: one main file, no imports, lengths in mm, angles in degrees.
 
-## 3d-deburr — v0.6.0
+## 3d-deburr — v0.6.1
 
 Goal: a clean, consistent edge break on every sharp outside edge of a 3D part. A break whose width varies along the edge is not acceptable.
 
@@ -22,6 +22,7 @@ A Path op can't follow a path the plugin computes (one depth only, tip on the ed
 4. Waiting on PhysCAD: a `workspace` option for toolbar buttons / a `workspaceChanged` event (would replace the 2 s `cam.setups` polling in panel.js).
 
 ### Rules
+- The repo is public and MIT licensed (`LICENSE`, copyright Music City Mfg). PhysCAD's developer has been told he may build this into PhysCAD.
 - Use the word "CAM", not "Manufacture", in UI text.
 - Op names follow `<setup#>-<two-digit sequence> <label>`.
 - Keep PhysCAD requests small: at most 1,500 points per `inspect.surfaceNormals` call, one request at a time. Larger, parallel requests stopped the modeling engine once.
