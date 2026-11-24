@@ -54,12 +54,13 @@ async function busy(btn, fn) {
 $("find").addEventListener("click", () => busy($("find"), async () => {
   const r = await physcad.commands.run("findEdges", findOpts());
   showCam(r.inCam);
-  status.textContent = `${r.edges.length} edges to deburr` + (r.inCam ? " (highlighted)." : ". Switch to CAM to see them highlighted.") + skippedText(r.skipped);
+  const wavy = r.edges.filter((e) => e.kind === "3d").length;
+  status.textContent = `${r.edges.length} edges to deburr (${r.edges.length - wavy} level, ${wavy} 3D)` + (r.inCam ? " (highlighted)." : ". Switch to CAM to see them highlighted.") + skippedText(r.skipped);
 }));
 
 $("make").addEventListener("click", () => busy($("make"), async () => {
   const r = await physcad.commands.run("createDeburr", { ...findOpts(), ...common() });
-  status.textContent = `Made ${r.name} on ${r.edgeCount} edges.` + skippedText(r.skipped);
+  status.textContent = `Made ${r.ops.map((o) => `${o.name} on ${o.edgeCount} edges`).join(" and ")}.` + skippedText(r.skipped);
 }));
 
 $("picked").addEventListener("click", () => busy($("picked"), async () => {

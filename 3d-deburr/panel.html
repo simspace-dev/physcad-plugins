@@ -15,7 +15,7 @@
 <div class="prop"><label title="Split the chamfer into this many cuts, each a little deeper. Use more passes for a wide chamfer or hard material.">Passes</label><pc-number id="passes" kind="count" value="1" min="1" max="10" step="1"></pc-number></div>
 <div class="prop"><label title="Tool number from your library. Leave blank to use the first chamfer mill or spot drill found.">Tool #</label><input id="tool" type="text" size="6" placeholder="auto"></div>
 
-<p class="note"><b>Auto (flat edges)</b></p>
+<p class="note"><b>Auto</b></p>
 <div class="prop"><label title="Only break edges where the two faces meet at least this sharply. 90 = a square corner. Lower finds more edges.">Min angle</label><pc-number id="angle" kind="angle" value="30" min="0" max="179" step="1"></pc-number></div>
 <div class="prop"><label title="Leave out edges that already have a small chamfer or round drawn on the model.">Skip chamfered</label><input id="skipModeled" type="checkbox" checked></div>
 <div class="prop"><label title="Leave out the edges of holes whose size is between Hole min and Hole max (e.g. tapped holes).">Skip holes</label><input id="skipHoles" type="checkbox"></div>
@@ -28,7 +28,7 @@
 <p class="note" id="excludedNote"></p>
 <div class="actions">
   <button id="find" title="Highlight the edges that would be deburred, without making a toolpath.">Find edges</button>
-  <button class="primary" id="make" title="Make one chamfer toolpath on all the edges Find edges shows.">Create deburr</button>
+  <button class="primary" id="make" title="Make the toolpaths for all the edges Find edges shows: a chamfer toolpath for level edges and a Path toolpath for wavy or sloped ones.">Create deburr</button>
 </div>
 
 <p class="note"><b>Wavy or 3D edges:</b> pick them on the part, then:</p>

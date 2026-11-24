@@ -1,6 +1,7 @@
-// 3D Deburr (3-axis, version 0.4)
+// 3D Deburr (3-axis, version 0.5.0)
 // Finds sharp, outside (convex) edges on the open CAM setup's part that a tool coming down the
-// setup's Z axis can reach, then adds ONE 2D Chamfer operation on all of them.
+// setup's Z axis can reach, on any kind of surface, checked at points all along each edge. Level
+// edges get one 2D Chamfer operation; wavy or sloped (3D) edges get one Path operation.
 // Runs in PhysCAD's plugin sandbox: one file, no imports. Lengths mm, angles degrees.
 
 const DEFAULT_MIN_ANGLE = 30;   // edges whose faces meet at less than this are "smooth" and skipped
@@ -17,82 +18,58 @@ const deg = (r) => (r * 180) / Math.PI;
 
 const run = (name, args) => physcad.commands.run(name, args || {});
 
-// Outward surface normal of a face at a point on it (null if this surface type isn't handled yet).
-function normalAt(face, p) {
-  if (face.surface === "plane" && face.normal) return unit(face.normal);
-  if (face.surface === "cylinder" && face.axis) {
-    const d = unit(face.axis.dir);
-    const v = sub(p, face.axis.origin);
-    const radial = unit(sub(v, scale(d, dot(v, d))));
-    if (!radial) return null;
-    return face.internal ? scale(radial, -1) : radial; // a hole's material faces the axis
-  }
-  return null;
-}
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const clamp1 = (x) => Math.max(-1, Math.min(1, x));
 
-const PROBE = 0.05; // mm: how far below an edge we probe to measure a wall's steepness
+const SAMPLE_STEP = 2;     // mm between the points checked along an edge
+const MAX_SAMPLES = 400;
+const PROBE = 0.05;        // mm: how far across a face we step to see which side it lies on
+const LEVEL_TOL = 0.01;    // mm: an edge whose height varies less than this is "level"
 
-const isUpFlat = (f, z) => f.surface === "plane" && f.normal && dot(unit(f.normal), z) > 0.999;
-
-// Is the edge level (all at one height along the tool axis)?
-function isLevel(edge, A, B, zAxis) {
-  if (isUpFlat(A, zAxis) || isUpFlat(B, zAxis)) return true; // every edge of a flat top lies in it
-  const pts = [...(edge.endpoints || []), edge.midpoint].filter(Boolean);
-  if (pts.length < 2) return false;
-  const h = pts.map((q) => dot(q, zAxis));
-  return Math.max(...h) - Math.min(...h) < 0.01;
-}
-
-// Steepness of a face with no direction data (e.g. a spline wall), measured just under an edge that
-// sits on an upward flat face: returns |cos| of the angle between the wall and the tool axis.
-async function wallCosUnder(body, faceName, p, zAxis) {
-  const q = sub(p, scale(zAxis, PROBE));
-  const r = await run("inspect.body", { body, maxFaces: 0, faceAt: { point: q, tol: PROBE * 2 } });
-  const hit = (r.faceAt || []).find((h) => h.face === faceName);
-  if (!hit) return null;
-  return Math.min(1, hit.distance / PROBE);
-}
-
-// Classify one edge. Returns { ok, kind: "level" | "3d", reason, angle }.
-async function classifyEdge(body, edge, facesByName, zAxis, minAngle) {
+// Classify one edge by checking it at points all along its length, on any kind of surface.
+// Returns { ok, kind: "level" | "3d", reason, angle } (angle: the smallest along the edge).
+async function classifyEdge(body, edge, zAxis, minAngle) {
   if (!edge.faces || edge.faces.length !== 2) return { ok: false, reason: "not between two faces" };
-  let A = facesByName[edge.faces[0]], B = facesByName[edge.faces[1]];
-  if (!A || !B) return { ok: false, reason: "face data missing" };
-  // Reference face: an upward flat if there is one, else any flat face.
-  if (isUpFlat(B, zAxis) || (A.surface !== "plane" && B.surface === "plane")) [A, B] = [B, A];
-  const p = edge.midpoint;
-  const nA = normalAt(A, p);
-  let nB = normalAt(B, p);
-  let angle;
+  const [faceA, faceB] = edge.faces;
+  const count = Math.max(5, Math.min(MAX_SAMPLES, Math.ceil((edge.length || 0) / SAMPLE_STEP) + 1));
+  const ep = await run("inspect.edgePoints", { body, edge: edge.key, count });
+  const samples = (ep && ep.points) || [];
+  if (samples.length < 2) return { ok: false, reason: "could not sample the edge" };
+  const pts = samples.map((s) => s.point);
+  const [ra, rb] = await Promise.all([
+    run("inspect.surfaceNormals", { body, face: faceA, points: pts }),
+    run("inspect.surfaceNormals", { body, face: faceB, points: pts }),
+  ]);
+  const nA = ra.points.map((r) => unit(r.normal)), nB = rb.points.map((r) => unit(r.normal));
 
-  if (nA && nB) {
-    angle = deg(Math.acos(Math.max(-1, Math.min(1, dot(nA, nB)))));
-  } else if (nA && isUpFlat(A, zAxis)) {
-    const c = await wallCosUnder(body, B.name, p, zAxis); // wall of unknown shape under a flat top
-    if (c === null) return { ok: false, reason: "could not measure the wall" };
-    angle = deg(Math.acos(c));
-  } else {
-    return { ok: false, reason: "two curved faces (not handled yet)" };
+  // Which way face B runs away from the edge: step both ways across it, square to the edge;
+  // the step that stays on face B is the one into it.
+  const across = samples.map((s, i) => unit(cross(s.tangent, nB[i])) || [0, 0, 0]);
+  const probes = [];
+  pts.forEach((p, i) => { probes.push(add(p, scale(across[i], PROBE)), sub(p, scale(across[i], PROBE))); });
+  const rp = await run("inspect.surfaceNormals", { body, face: faceB, points: probes });
+
+  let minA = 180, smooth = 0, inside = 0, down = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (!nA[i] || !nB[i]) return { ok: false, reason: "face data missing" };
+    const a = deg(Math.acos(clamp1(dot(nA[i], nB[i]))));
+    minA = Math.min(minA, a);
+    if (a < minAngle) { smooth++; continue; }           // too gentle here to need a deburr
+    const plus = rp.points[2 * i].distance, minus = rp.points[2 * i + 1].distance;
+    const intoB = plus <= minus ? across[i] : scale(across[i], -1);
+    if (!(dot(intoB, nA[i]) < -1e-3)) { inside++; continue; } // B folds up in front of A: inside corner
+    const bis = unit(add(nA[i], nB[i]));
+    if (!bis || dot(bis, zAxis) < 0.05) down++;          // the corner faces down or sideways
   }
-  if (angle < minAngle) return { ok: false, reason: "smooth edge (below minimum angle)", angle };
+  const n = pts.length, part = (k) => (k === n ? "" : "partly ");
+  const angle = minA;
+  if (smooth) return { ok: false, reason: part(smooth) + "smooth edge (below minimum angle)", angle };
+  if (inside) return { ok: false, reason: part(inside) + "inside corner (no burr)", angle };
+  if (down) return { ok: false, reason: (down === n ? "" : "partly ") + "faces down or sideways (needs another setup)", angle };
 
-  // Outside corner test: face B's center sits behind face A's surface.
-  if (nA) {
-    let side = dot(sub(B.centroid, p), nA);
-    if (Math.abs(side) < 1e-6 && nB && B.surface === "plane") side = dot(sub(A.centroid, p), nB);
-    if (!(side < -1e-6)) return { ok: false, reason: "inside corner (no burr)", angle };
-  }
-
-  // Reachable from above: the edge must face up the tool axis.
-  if (nB) {
-    const bis = unit(add(nA, nB));
-    if (!bis || dot(bis, zAxis) < 0.05) return { ok: false, reason: "faces down or sideways (needs another setup)", angle };
-  } else if (!isUpFlat(A, zAxis)) {
-    return { ok: false, reason: "faces down or sideways (needs another setup)", angle };
-  }
-
-  if (isLevel(edge, A, B, zAxis)) return { ok: true, kind: "level", angle };
-  return { ok: false, reason: "not level (sloped or wavy in height)", angle };
+  const h = pts.map((q) => dot(q, zAxis));
+  const kind = Math.max(...h) - Math.min(...h) < LEVEL_TOL ? "level" : "3d";
+  return { ok: true, kind, angle };
 }
 
 async function openSetup() {
@@ -142,10 +119,10 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
         const hole = faces.find((f) => f.surface === "cylinder" && f.internal);
         if (hole && 2 * hole.radius >= holeMin && 2 * hole.radius <= holeMax) { skip("hole in the skipped size range"); continue; }
       }
-      const c = await classifyEdge(body, e, facesByName, zAxis, minAngle);
+      const c = await classifyEdge(body, e, zAxis, minAngle);
       if (!c.ok) { skip(c.reason); continue; }
       if (skipModeled && c.angle < MODELED_MAX_ANGLE && faces.some((f) => widths[f.name] < MODELED_MAX_WIDTH)) { skip("already chamfered or rounded on the model"); continue; }
-      found.push({ body, edge: e.key, angle: Math.round(c.angle), length: Math.round(e.length * 100) / 100 });
+      found.push({ body, edge: e.key, kind: c.kind, angle: Math.round(c.angle), length: Math.round(e.length * 100) / 100 });
     }
   }
   return { setup: info.setup.id, edges: found, skipped };
@@ -214,10 +191,28 @@ physcad.commands.register({
   },
 });
 
+// A Path toolpath with a pointed tool's tip run along each edge, `width` below it. On a
+// straight-down wall with a 90° tool that leaves a 45° chamfer `width` wide on each face. Where
+// the face beside an edge rises at 45° or more, the tool's side will dig into it: the plugin
+// doesn't check that yet, so the simulation must.
+function checkPointed(t, width) {
+  if (!/chamfer|spot|engrave/i.test(t.type || "")) throw new Error(`Tool ${t.number} is a ${t.type}: 3D edges need a pointed chamfer mill or spot drill`);
+  if ((t.tipDiameter || 0) > 0.05) throw new Error(`Tool ${t.number} has a flat tip; 3D edges need one with a sharp point`);
+  const reach = (t.diameter / 2) / Math.tan(((t.tipAngle || 90) / 2) * Math.PI / 180);
+  if (width >= reach) throw new Error(`The width is too big for tool ${t.number}'s cone`);
+}
+async function makePathOp(setupId, edges, t, width, passes) {
+  const name = await nextName(setupId, "Deburr 3D");
+  const fields = { name, tool: t.number, geometry: { edges: edges.map((e) => ({ body: e.body, edge: e.edge })) }, heights: { bottomOffset: -width } };
+  if (passes > 1) fields.stepdown = width / passes;
+  const op = await run("cam.op.trace", { fields });
+  return { op, name, edgeCount: edges.length };
+}
+
 physcad.commands.register({
   id: "createDeburr",
   title: "Create deburr toolpath",
-  description: "Add one 2D Chamfer operation that breaks every edge findEdges finds. width: chamfer width mm (default 0.25). passes: 1-10 (default 1). tool: library tool number (default: first chamfer mill or spot drill).",
+  description: "Deburr every edge findEdges finds: one 2D Chamfer operation for the level edges and one Path operation for the wavy or sloped (3D) edges. width: chamfer width mm (default 0.25). passes: 1-10 (default 1). tool: library tool number (default: first chamfer mill or spot drill).",
   params: {
     type: "object",
     properties: { ...FIND_PARAMS, width: { type: "number" }, passes: { type: "integer" }, tool: { type: ["number", "string"] } },
@@ -229,20 +224,25 @@ physcad.commands.register({
     checkPasses(passes);
     const r = await findEdges(findArgs(a));
     if (!r.edges.length) throw new Error("No reachable sharp edges found");
+    const level = r.edges.filter((e) => e.kind === "level"), wavy = r.edges.filter((e) => e.kind === "3d");
     const t = await pickTool(tool);
-    const name = await nextName(r.setup);
-    const op = await run("cam.op.chamfer", {
-      fields: { name, tool: t.number, geometry: { edges: r.edges.map((e) => ({ body: e.body, edge: e.edge })) }, chamferWidth: width, chamferPasses: passes },
-    });
-    await physcad.ui.toast(`${name}: ${r.edges.length} edges. Check it in simulation before cutting.`, "success");
-    return { op, name, edgeCount: r.edges.length, skipped: r.skipped };
+    if (wavy.length) checkPointed(t, width);
+    const ops = [];
+    if (level.length) {
+      const name = await nextName(r.setup);
+      const op = await run("cam.op.chamfer", {
+        fields: { name, tool: t.number, geometry: { edges: level.map((e) => ({ body: e.body, edge: e.edge })) }, chamferWidth: width, chamferPasses: passes },
+      });
+      ops.push({ op, name, edgeCount: level.length });
+    }
+    if (wavy.length) ops.push(await makePathOp(r.setup, wavy, t, width, passes));
+    const names = ops.map((o) => `${o.name} (${o.edgeCount} edges)`).join(" and ");
+    await physcad.ui.toast(`Made ${names}. Check it in simulation before cutting.`, "success");
+    return { ops, edgeCount: r.edges.length, skipped: r.skipped };
   },
 });
 
-// Wavy / 3D edges the person picks: a Path toolpath with the pointed tool's tip run along each
-// edge, `width` below it. On a straight-down wall with a 90° tool that leaves a 45° chamfer
-// `width` wide on each face. Where the face beside an edge rises at 45° or more, the tool's
-// side will dig into it: the plugin can't check that yet, so the simulation must.
+// Edges the person picks, any shape: one Path operation.
 physcad.commands.register({
   id: "deburrSelected",
   title: "Deburr selected edges",
@@ -264,16 +264,10 @@ physcad.commands.register({
     const picks = edges && edges.length ? edges : await selectedEdges();
     if (!picks.length) throw new Error("Pick one or more edges on the part first");
     const t = await pickTool(tool);
-    if (!/chamfer|spot|engrave/i.test(t.type || "")) throw new Error(`Tool ${t.number} is a ${t.type}: use a pointed chamfer mill or spot drill`);
-    if ((t.tipDiameter || 0) > 0.05) throw new Error(`Tool ${t.number} has a flat tip; use one with a sharp point`);
-    const reach = (t.diameter / 2) / Math.tan(((t.tipAngle || 90) / 2) * Math.PI / 180);
-    if (width >= reach) throw new Error(`The width is too big for tool ${t.number}'s cone`);
-    const name = await nextName(info.setup.id, "Deburr 3D");
-    const fields = { name, tool: t.number, geometry: { edges: picks }, heights: { bottomOffset: -width } };
-    if (passes > 1) fields.stepdown = width / passes;
-    const op = await run("cam.op.trace", { fields });
-    await physcad.ui.toast(`${name}: ${picks.length} edges. Check it in simulation: steep faces next to an edge can be gouged.`, "success");
-    return { op, name, edgeCount: picks.length };
+    checkPointed(t, width);
+    const r = await makePathOp(info.setup.id, picks, t, width, passes);
+    await physcad.ui.toast(`${r.name}: ${picks.length} edges. Check it in simulation: steep faces next to an edge can be gouged.`, "success");
+    return r;
   },
 });
 

@@ -2,9 +2,11 @@
 
 Plugins for [PhysCAD](https://physcad.io), one folder per plugin.
 
-| Plugin | What it does |
-|---|---|
-| [3d-deburr](3d-deburr/) | Breaks the sharp edges on 3D parts (including wavy and sloped edges) by adding chamfer toolpaths in CAM. |
+| Plugin | Version | What it does |
+|---|---|---|
+| [3d-deburr](3d-deburr/) | 0.5.0 | Breaks the sharp edges on 3D parts (including wavy and sloped edges) by adding chamfer toolpaths in CAM. Finds wavy and sloped edges automatically. Work in progress, not released. |
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## Loading a plugin for development
 
