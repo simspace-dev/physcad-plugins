@@ -1,0 +1,44 @@
+<style>
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .actions button { white-space: nowrap; flex: 1 1 auto; }
+  .prop > label { white-space: normal; text-overflow: clip; line-height: 1.2; }
+  .prop > label[data-tip] { text-decoration: underline dotted; text-decoration-color: var(--text-dim); text-underline-offset: 3px; }
+  .cam-warn { margin: 4px 12px 8px; padding: 6px 8px; border-radius: 5px; border: 1px solid var(--warn, #d08a00); color: var(--text); background: color-mix(in srgb, var(--warn, #d08a00) 14%, transparent); }
+  #tip { position: fixed; z-index: 1000; max-width: min(240px, calc(100vw - 16px)); padding: 6px 8px; border-radius: 5px;
+         background: var(--panel-solid, #fff); color: var(--text); border: 1px solid var(--panel-border); box-shadow: var(--panel-shadow, 0 4px 14px rgba(0,0,0,.25));
+         font-size: 11px; line-height: 1.35; pointer-events: none; opacity: 0; transition: opacity .12s; }
+  #tip.show { opacity: 1; }
+</style>
+<p class="cam-warn" id="camWarn" hidden>3D Deburr works in the CAM workspace. Switch to CAM and open a setup to use it.</p>
+<p class="note">Breaks the sharp outside edges you can reach from above in the open setup. Check the result in simulation before cutting.</p>
+<div class="prop"><label title="How wide the chamfer is on each edge. Type a unit (e.g. 0.5 mm) to use a different unit than the document.">Width</label><pc-number id="width" kind="length" value="0.25" min="0.01"></pc-number></div>
+<div class="prop"><label title="Split the chamfer into this many cuts, each a little deeper. Use more passes for a wide chamfer or hard material.">Passes</label><pc-number id="passes" kind="count" value="1" min="1" max="10" step="1"></pc-number></div>
+<div class="prop"><label title="Tool number from your library. Leave blank to use the first chamfer mill or spot drill found.">Tool #</label><input id="tool" type="text" size="6" placeholder="auto"></div>
+
+<p class="note"><b>Auto (flat edges)</b></p>
+<div class="prop"><label title="Only break edges where the two faces meet at least this sharply. 90 = a square corner. Lower finds more edges.">Min angle</label><pc-number id="angle" kind="angle" value="30" min="0" max="179" step="1"></pc-number></div>
+<div class="prop"><label title="Leave out edges that already have a small chamfer or round drawn on the model.">Skip chamfered</label><input id="skipModeled" type="checkbox" checked></div>
+<div class="prop"><label title="Leave out the edges of holes whose size is between Hole min and Hole max (e.g. tapped holes).">Skip holes</label><input id="skipHoles" type="checkbox"></div>
+<div class="prop"><label title="Smallest hole size to skip. You can type a unit, e.g. 6.5 mm.">Hole min</label><pc-number id="holeMin" kind="length" value="0" min="0"></pc-number></div>
+<div class="prop"><label title="Largest hole size to skip. You can type a unit, e.g. 8 mm.">Hole max</label><pc-number id="holeMax" kind="length" value="10" min="0"></pc-number></div>
+<div class="actions">
+  <button id="exclude" title="Click edges on the part, then press this. Find edges and Create deburr will leave them out. Saved with this document.">Exclude picked</button>
+  <button id="clear" title="Forget all the edges you excluded in this document.">Clear excluded</button>
+</div>
+<p class="note" id="excludedNote"></p>
+<div class="actions">
+  <button id="find" title="Highlight the edges that would be deburred, without making a toolpath.">Find edges</button>
+  <button class="primary" id="make" title="Make one chamfer toolpath on all the edges Find edges shows.">Create deburr</button>
+</div>
+
+<p class="note"><b>Wavy or 3D edges:</b> pick them on the part, then:</p>
+<div class="actions">
+  <button id="pickMode" title="While on, each click adds an edge to your picks and clicking a picked edge removes it. No Shift key needed.">Pick mode: off</button>
+  <button id="pickClear" title="Unpick all edges.">Clear picks</button>
+</div>
+<p class="note">Pick mode on: click edges to add them, click a picked edge to remove it. No Shift key needed.</p>
+<div class="actions"><button class="primary" id="picked" title="Make a toolpath that follows the edges you picked, even wavy 3D ones. Check the simulation for gouges.">Deburr selected edges</button></div>
+
+<p class="note" id="status"></p>
+<div id="tip"></div>
+<script src="panel.js"></script>

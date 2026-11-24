@@ -1,0 +1,13 @@
+{
+  "id": "com.musiccitymfg.3d-deburr",
+  "name": "3D Deburr",
+  "version": "0.4.0",
+  "author": "Music City Mfg",
+  "description": "Finds the sharp outside edges of the part that the tool can reach from above, and adds one chamfer toolpath that breaks them all.",
+  "apiVersion": 1,
+  "main": "main.js",
+  "icon": "icon.svg",
+  "permissions": ["model.read", "cam", "view", "ui"],
+  "network": [],
+  "ui": [{ "id": "panel", "title": "3D Deburr", "html": "panel.html", "place": "right" }]
+}
