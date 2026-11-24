@@ -13,10 +13,12 @@
 <p class="note">Breaks the sharp outside edges you can reach from above in the open setup. Check the result in simulation before cutting.</p>
 <div class="prop"><label title="How wide the chamfer is on each edge. Type a unit (e.g. 0.5 mm) to use a different unit than the document.">Width</label><pc-number id="width" kind="length" value="0.25" min="0.01"></pc-number></div>
 <div class="prop"><label title="Split the chamfer into this many cuts, each a little deeper. Use more passes for a wide chamfer or hard material.">Passes</label><pc-number id="passes" kind="count" value="1" min="1" max="10" step="1"></pc-number></div>
-<div class="prop"><label title="Tool number from your library. Leave blank to use the first chamfer mill or spot drill found.">Tool #</label><input id="tool" type="text" size="6" placeholder="auto"></div>
+<div class="prop"><label title="How far the cut width on a wavy or sloped edge may differ from Width, in percent, before that edge is left out. Smaller is stricter.">Tolerance %</label><pc-number id="tolerance" kind="count" value="20" min="1" max="500" step="1"></pc-number></div>
+<div class="prop"><label title="Tool number from your library. Leave blank to use a chamfer mill or spot drill, one this setup already uses if it can. The message below names the tool chosen.">Tool #</label><input id="tool" type="text" size="6" placeholder="auto"></div>
 
 <p class="note"><b>Auto</b></p>
 <div class="prop"><label title="Only break edges where the two faces meet at least this sharply. 90 = a square corner. Lower finds more edges.">Min angle</label><pc-number id="angle" kind="angle" value="30" min="0" max="179" step="1"></pc-number></div>
+<div class="prop"><label title="Level edges only: how close the side of the tool may come to a wall it isn't chamfering, where an edge runs into a step or boss. 0 lets it touch.">Wall clear</label><pc-number id="wallClear" kind="length" value="0" min="0"></pc-number></div>
 <div class="prop"><label title="Leave out edges that already have a small chamfer or round drawn on the model.">Skip chamfered</label><input id="skipModeled" type="checkbox" checked></div>
 <div class="prop"><label title="Leave out the edges of holes whose size is between Hole min and Hole max (e.g. tapped holes).">Skip holes</label><input id="skipHoles" type="checkbox"></div>
 <div class="prop"><label title="Smallest hole size to skip. You can type a unit, e.g. 6.5 mm.">Hole min</label><pc-number id="holeMin" kind="length" value="0" min="0"></pc-number></div>
@@ -28,6 +30,7 @@
 <p class="note" id="excludedNote"></p>
 <div class="actions">
   <button id="find" title="Highlight the edges that would be deburred, without making a toolpath.">Find edges</button>
+  <button id="leftOut" title="Highlight the edges the last search left out: ones the tool can't cut cleanly, or that are sharp along only part of their length.">Show left out</button>
   <button class="primary" id="make" title="Make the toolpaths for all the edges Find edges shows: a chamfer toolpath for level edges and a Path toolpath for wavy or sloped ones.">Create deburr</button>
 </div>
 
@@ -37,7 +40,7 @@
   <button id="pickClear" title="Unpick all edges.">Clear picks</button>
 </div>
 <p class="note">Pick mode on: click edges to add them, click a picked edge to remove it. No Shift key needed.</p>
-<div class="actions"><button class="primary" id="picked" title="Make a toolpath that follows the edges you picked, even wavy 3D ones. Check the simulation for gouges.">Deburr selected edges</button></div>
+<div class="actions"><button class="primary" id="picked" title="Make a toolpath that follows the edges you picked, even wavy 3D ones. Edges the tool can't cut cleanly within the tolerance are left out.">Deburr selected edges</button></div>
 
 <p class="note" id="status"></p>
 <div id="tip"></div>

@@ -1,5 +1,28 @@
 # Changelog
 
+## 3d-deburr 0.6.0 (2026-11-24)
+
+3D Deburr now checks every wavy or sloped edge before it cuts it, and only cuts the ones it can do cleanly. Before, it sent every edge it found to a toolpath and hoped. Now it works out how wide the cut would really be at points all along the edge, and leaves an edge out when the width would stray too far from what was asked, when the edge climbs too steeply for the tool's point, when the tool would cut a groove instead of a bevel, or when the tool would run into a wall nearby. Each edge it leaves out is listed with the reason, and a new Show left out button highlights them on the part.
+
+This version is honest rather than complete. On the wavy test part, with a 0.25 mm break and a 1/4" 90° chamfer mill, only the hole rim passes (0.218 to 0.246 mm). The other five top edges would come out anywhere from 0.21 to 0.65 mm wide, so they are left out. An even break on those edges needs the tool to move up, down and sideways as it follows the edge, and PhysCAD's Path toolpath can only run at one depth. The plugin already works out the depth needed at every point; a feature request to PhysCAD asks for a way to hand it over.
+
+- Width math corrected: the cut at a point now counts the tool at every position along the edge (positions 0.025 mm apart), not only the one beside it. Where an edge climbs, the wide part of the cone a little way down the slope cuts too: at a 37.8° climb a 90° tool cuts 1.59 times wider on the top face. Checked against hand-worked cases.
+- New reasons a 3D edge is left out: it climbs as steeply as the tool's side; both faces slope away from it (the tip would be buried and cut a V groove); another face nearby ends up inside the tool; a face beside it rises into the tool; the width varies more than the tolerance.
+- New Tolerance % setting (default 20): how far the cut width may differ from Width before an edge is left out.
+- The bevel width is measured across the bevel face, as the width of a square corner's chamfer with the same face.
+- Level edges go to 2D Chamfer only when they are a flat top over a vertical wall all the way along. Any other level edge is treated as a 3D edge and checked.
+- New Wall clear setting for the level edges' chamfer toolpath (PhysCAD's 2D Chamfer wall clearance).
+- Picked edges get the same checks, plus the inside-corner and facing-down tests. `keepFlagged` cuts them anyway.
+- Tool choice: with Tool # blank it prefers a pointed tool the setup already uses, then one with a real tool number. Tools are assigned by id, so a repeated tool number can't pick the wrong tool. The panel names the tool chosen.
+- Toolpath names use one more than the highest sequence number in the setup, so they no longer repeat after a delete.
+- Edges skipped because only part of them qualifies are listed (`partial`) and shown by Show left out.
+- Results give lengths in the document's units in the panel.
+- Skip holes and Skip chamfered now work on parts with more than 300 faces.
+- Multiple passes on a Path toolpath tested: two passes step down evenly to the full depth.
+- PhysCAD is asked for points in batches of 1,500 at most, one request at a time. A heavier version stopped the modeling engine once.
+- Developer command `evenDepth`: the tip depth at each point of an edge that would give an even bevel (0.097 to 0.303 mm along the test part's pocket rim for a 0.25 mm break).
+- Known limits: Find edges takes about 48 seconds on the wavy test part. Create deburr from the panel, Show left out, and the changed level-edge rule have not been run on a real part yet.
+
 ## 3d-deburr 0.5.0 (2026-11-24)
 
 3D Deburr now finds wavy and sloped edges by itself. Before, the automatic search only found edges that sat at one height, so a part with a wavy top had to have its edges clicked one by one. The plugin now walks along every edge of the part, checking it about every 2 mm, and looks at which way the two faces on either side of the edge are pointing at each spot. From that it decides whether the edge is a sharp outside corner that needs a burr removed and whether the tool can reach it from above. This works on every kind of surface, including freeform (spline) surfaces, using the surface-normal and edge-point tools that PhysCAD added for plugins in its latest update.

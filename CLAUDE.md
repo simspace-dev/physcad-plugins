@@ -2,18 +2,26 @@
 
 One folder per plugin. Plugins run in PhysCAD's plugin sandbox: one main file, no imports, lengths in mm, angles in degrees.
 
-## 3d-deburr — v0.5.0
+## 3d-deburr — v0.6.0
+
+Goal: a clean, consistent edge break on every sharp outside edge of a 3D part. A break whose width varies along the edge is not acceptable.
 
 - Auto-finds sharp, outside, top-reachable edges on any surface type by sampling each edge (`inspect.edgePoints`) and reading face normals (`inspect.surfaceNormals`).
-- Level edges → one 2D Chamfer op (`<setup#>-<NN> Deburr`); wavy/sloped edges → one Path op (`cam.op.trace`, `<setup#>-<NN> Deburr 3D`).
-- Picked edges → Path op (`deburrSelected`). Pick mode, hole skipping, exclusions, passes, skip modeled chamfers.
+- Level edges (one height AND a flat top over a vertical wall) → one 2D Chamfer op (`<setup#>-<NN> Deburr`). Everything else is a 3D edge → one Path op (`cam.op.trace`, `<setup#>-<NN> Deburr 3D`), tip straight below the edge at one depth.
+- `cutCheck` checks every 3D edge first and leaves it out when: steep (climbs as steeply as the cone's side), notch (both faces face up, tip buried), hit (another face inside the tool), digs, or uneven (width off by more than Tolerance %, default 20). It counts the tool at every position along the edge.
+- Picked edges → Path op (`deburrSelected`) after the same checks. Pick mode, hole skipping, exclusions, passes, skip modeled chamfers, wall clearance, Show left out.
+- Wavy test part, 0.25 mm, T5 1/4" 90° chamfer mill: only the hole rim passes; the other five top edges are 0.21–0.65 mm and are left out.
 
-### Next
-1. Gouge check on 3D edges (tool cone vs. the faces beside the edge).
-2. "Model Chamfer" option: keep the chamfer width constant along tilted 3D edges.
-3. PhysCAD's new edge-gouge warning fires on every deburr Path op (the chamfer isn't modeled). Feature request drafted for an optional "allowed cut into part" setting on Path ops.
+### Blocked on PhysCAD
+A Path op can't follow a path the plugin computes (one depth only, tip on the edge). Requested: an optional `points` field on `cam.op.trace` (chains of 3D tip positions), plus `source` edges and an `allowedCut` for the edge-gouge warning. `evenDepths()` already computes the depth per point. When it lands: build the tip path (depth, then a sideways shift so the flank cuts, not the tip), add ball end mills, partial edges.
+
+### Next (not blocked)
+1. Speed: Find edges takes ~48 s on the wavy test part (`inspect.surfaceNormals` on spline faces is slow). Skip the check for plane/plane edges, cache per edge.
+2. Test on a real part: Create deburr from the panel, Show left out, the level-edge rule.
+3. Holder and shank check.
 4. Waiting on PhysCAD: a `workspace` option for toolbar buttons / a `workspaceChanged` event (would replace the 2 s `cam.setups` polling in panel.js).
 
 ### Rules
 - Use the word "CAM", not "Manufacture", in UI text.
 - Op names follow `<setup#>-<two-digit sequence> <label>`.
+- Keep PhysCAD requests small: at most 1,500 points per `inspect.surfaceNormals` call, one request at a time. Larger, parallel requests stopped the modeling engine once.
