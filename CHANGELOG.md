@@ -1,5 +1,17 @@
 # Changelog
 
+## 3d-deburr 0.6.5 (2026-11-25)
+
+The plugin now recovers by itself when PhysCAD's modeling engine stops. The modeling engine is the part of PhysCAD that does the geometry math. During testing it stopped once in the middle of a search and restarted itself; nothing in the file was lost, but the search ended with an error and had to be run again by hand. The cause is not known, and it happened once in about eight searches.
+
+Now, when the engine stops on one of the plugin's questions about the part, the plugin waits a moment and asks the same question again, up to three tries. In most cases you will not notice anything. If the engine still does not answer, the plugin shows a plain message saying that nothing was lost and to press the button again, and the edges it had already checked are not checked again.
+
+- `run` catches PhysCAD's "modeling engine stopped" error. For a command that only reads the model (`inspect.*`) it waits 1.5 seconds, then 3 seconds, and asks again, up to 3 tries in all.
+- A command that changes the file, such as the one that creates a toolpath, is never repeated, so a retry cannot make a duplicate toolpath.
+- After the last try the error reads: "PhysCAD's modeling engine stopped while working on this and did not recover. Nothing was lost. Try again: edges already checked are not checked again."
+- `findEdges` reports `timing.engineRestarts`: how many times the engine stopped during the search.
+- Tested with a simulated engine stop (two stops then an answer; three stops; a stop on a command that changes the file; an unrelated error). A normal search still runs clean in PhysCAD. Not tested against a real engine stop, which cannot be caused on demand.
+
 ## 3d-deburr 0.6.4 (2026-11-25)
 
 The plugin now cuts wavy edges instead of refusing them. Until this version it left out any wavy or sloped edge it could not break at an even width, which on the wavy test part was five of the six top edges, so in practice it did very little. Now Find edges and Create deburr include those edges, and Deburr selected edges cuts every edge you pick.

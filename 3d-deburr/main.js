@@ -1,4 +1,4 @@
-// 3D Deburr (3-axis, version 0.6.4)
+// 3D Deburr (3-axis, version 0.6.5)
 // Finds sharp, outside (convex) edges on the open CAM setup's part that a tool coming down the
 // setup's Z axis can reach, on any kind of surface, checked at points all along each edge. Level
 // edges (a flat top over a vertical wall) get one 2D Chamfer operation; wavy or sloped (3D)
@@ -18,11 +18,27 @@ const unit = (a) => { const l = len(a); return l > 1e-12 ? scale(a, 1 / l) : nul
 const deg = (r) => (r * 180) / Math.PI;
 
 // Every PhysCAD command goes through here, and is timed (findEdges reports the totals).
-let callStats = {};
+// PhysCAD's modeling engine now and then stops on a question and restarts itself (nothing is
+// lost). A question that only reads the model (inspect.*) is then asked again, after a pause.
+let callStats = {}, engineRestarts = 0;
+const ENGINE_TRIES = 3, ENGINE_WAIT = 1500;   // ms before asking again (twice that the second time)
+const engineStopped = (e) => /engine stopped/i.test(String((e && e.message) || e));
+const pause = (ms) => new Promise((done) => (typeof setTimeout === "function" ? setTimeout(done, ms) : done()));
 const run = async (name, args) => {
   const t0 = Date.now();
-  try { return await physcad.commands.run(name, args || {}); }
-  finally {
+  try {
+    for (let attempt = 1; ; attempt++) {
+      try { return await physcad.commands.run(name, args || {}); }
+      catch (e) {
+        if (!engineStopped(e)) throw e;
+        engineRestarts++;
+        if (!name.startsWith("inspect.") || attempt >= ENGINE_TRIES) {
+          throw new Error("PhysCAD's modeling engine stopped while working on this and did not recover. Nothing was lost. Try again: edges already checked are not checked again.");
+        }
+        await pause(ENGINE_WAIT * attempt);
+      }
+    }
+  } finally {
     const s = callStats[name] || (callStats[name] = { calls: 0, points: 0, ms: 0 });
     s.calls++; s.ms += Date.now() - t0;
     if (args && Array.isArray(args.points)) s.points += args.points.length;
@@ -414,6 +430,7 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
   if (!(tolerance > 0)) throw new Error("The tolerance must be more than 0");
   const started = Date.now();
   callStats = {};
+  engineRestarts = 0;
   const info = await openSetup();
   const zAxis = unit(info.geometry.axes.z);
   const bodies = info.setup.bodies || [info.setup.body];
@@ -467,7 +484,7 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
   }
   lastLeftOut = [...flagged, ...partial].map((x) => ({ body: x.body, edge: x.edge }));
   const doc = await docInfo();
-  return { setup: info.setup.id, units: doc.units || "mm", width, tool: t ? toolLabel(t) : null, check, edges: found, uneven, skipped, flagged, partial, timing: { ms: Date.now() - started, reused, commands: callStats } };
+  return { setup: info.setup.id, units: doc.units || "mm", width, tool: t ? toolLabel(t) : null, check, edges: found, uneven, skipped, flagged, partial, timing: { ms: Date.now() - started, reused, engineRestarts, commands: callStats } };
 }
 
 // Pick a tool: the number or id given, else a chamfer mill / spot drill from the library.
