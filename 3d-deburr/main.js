@@ -1,4 +1,4 @@
-// 3D Deburr (3-axis, version 0.6.3)
+// 3D Deburr (3-axis, version 0.6.4)
 // Finds sharp, outside (convex) edges on the open CAM setup's part that a tool coming down the
 // setup's Z axis can reach, on any kind of surface, checked at points all along each edge. Level
 // edges (a flat top over a vertical wall) get one 2D Chamfer operation; wavy or sloped (3D)
@@ -407,7 +407,7 @@ function cacheFor(body, b, zAxis) {
   return edgeCache[body];
 }
 
-async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = false, holeMin = 0, holeMax = 10, skipModeled = true, width = DEFAULT_WIDTH, tool, tolerance = DEFAULT_TOL } = {}) {
+async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = false, holeMin = 0, holeMax = 10, skipModeled = true, width = DEFAULT_WIDTH, tool, tolerance = DEFAULT_TOL, keepUneven = true } = {}) {
   if (!(minAngle >= 0 && minAngle < 180)) throw new Error("The minimum angle must be between 0 and 180");
   if (skipHoles && !(holeMax >= holeMin)) throw new Error("The largest hole size must be at least the smallest");
   if (!(width > 0)) throw new Error("The chamfer width must be more than 0");
@@ -423,7 +423,7 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
   try { t = await pickTool(tool, info); checkPointed(t, width); checkTool = t; }
   catch (e) { check = "off: " + e.message; }
   const found = [], skipped = {}, flagged = [], partial = [];
-  let reused = 0;
+  let reused = 0, uneven = 0;
   const skip = (why) => { skipped[why] = (skipped[why] || 0) + 1; };
   for (const body of bodies) {
     const b = await run("inspect.body", { body, maxFaces: 100000 });
@@ -454,7 +454,9 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
         if (!g) { g = await cutCheck(body, e.key, c.data, checkTool, width, zAxis); cache.cut.set(gKey, g); }
         const why = verdict(g, width, tolerance);
         item.cutWidth = g.width;
-        if (why) {
+        // Uneven only: the tool cuts it safely, but the break's width varies. Kept unless told not to.
+        if (why === "uneven" && keepUneven) { item.uneven = true; uneven++; }
+        else if (why) {
           skip(REASONS[why]);
           flagged.push({ body, edge: e.key, why, reason: REASONS[why], cutWidth: g.width, at: g.at[why === "uneven" ? "widest" : why] });
           continue;
@@ -465,7 +467,7 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
   }
   lastLeftOut = [...flagged, ...partial].map((x) => ({ body: x.body, edge: x.edge }));
   const doc = await docInfo();
-  return { setup: info.setup.id, units: doc.units || "mm", tool: t ? toolLabel(t) : null, check, edges: found, skipped, flagged, partial, timing: { ms: Date.now() - started, reused, commands: callStats } };
+  return { setup: info.setup.id, units: doc.units || "mm", width, tool: t ? toolLabel(t) : null, check, edges: found, uneven, skipped, flagged, partial, timing: { ms: Date.now() - started, reused, commands: callStats } };
 }
 
 // Pick a tool: the number or id given, else a chamfer mill / spot drill from the library.
@@ -521,9 +523,10 @@ const FIND_PARAMS = {
   skipModeled: { type: "boolean", description: "Leave out edges already chamfered or rounded on the model (default true)" },
   width: { type: "number", description: "Chamfer width mm (default 0.25)" },
   tool: { type: ["number", "string"], description: "Library tool number or id (default: a chamfer mill or spot drill, one the setup already uses if it can)" },
-  tolerance: { type: "number", description: "Percent the cut width on a wavy or sloped (3D) edge may differ from width before the edge is left out (default 20)" },
+  tolerance: { type: "number", description: "Percent the cut width on a wavy or sloped (3D) edge may differ from width before the edge counts as uneven (default 20)" },
+  keepUneven: { type: "boolean", description: "Keep 3D edges whose only fault is an uneven cut width (default true; they are marked uneven: true). false leaves them out, listed in flagged." },
 };
-const findArgs = (a) => ({ minAngle: a.minAngle, exclude: a.exclude, skipHoles: a.skipHoles, holeMin: a.holeMin, holeMax: a.holeMax, skipModeled: a.skipModeled, width: a.width, tool: a.tool, tolerance: a.tolerance });
+const findArgs = (a) => ({ minAngle: a.minAngle, exclude: a.exclude, skipHoles: a.skipHoles, holeMin: a.holeMin, holeMax: a.holeMax, skipModeled: a.skipModeled, width: a.width, tool: a.tool, tolerance: a.tolerance, keepUneven: a.keepUneven });
 
 function checkPasses(passes) {
   if (!(Number.isInteger(passes) && passes >= 1 && passes <= 10)) throw new Error("Passes must be a whole number from 1 to 10");
@@ -532,7 +535,7 @@ function checkPasses(passes) {
 physcad.commands.register({
   id: "findEdges",
   title: "Find deburr edges",
-  description: "List (and highlight) the sharp outside edges of the open setup's part that a tool can reach from above. kind level: a flat top over a vertical wall at one height (2D Chamfer). kind 3d: anything else (Path); these are checked with the tool and width given, and left out (listed in flagged, with why and where) when the edge climbs too steeply for the tool, the tool would cut a groove, hit a nearby face or dig into a face beside the edge, or the cut width would vary more than tolerance. cutWidth: the narrowest and widest bevel along the edge, mm. partial: edges skipped because only part of them qualifies.",
+  description: "List (and highlight) the sharp outside edges of the open setup's part that a tool can reach from above. kind level: a flat top over a vertical wall at one height (2D Chamfer). kind 3d: anything else (Path); these are checked with the tool and width given, and left out (listed in flagged, with why and where) when the edge climbs too steeply for the tool, the tool would cut a groove, hit a nearby face or dig into a face beside the edge, or the cut width would vary more than tolerance. An edge whose only fault is an uneven cut width is kept and marked uneven: true, unless keepUneven is false. cutWidth: the narrowest and widest bevel along the edge, mm. partial: edges skipped because only part of them qualifies.",
   params: { type: "object", properties: { ...FIND_PARAMS, highlight: { type: "boolean" } }, additionalProperties: false },
   async run(a = {}) {
     const r = await findEdges(findArgs(a));
@@ -604,16 +607,18 @@ physcad.commands.register({
     if (wavy.length) ops.push(await makePathOp(r.setup, wavy, t, width, passes));
     const names = ops.map((o) => `${o.name} (${o.edgeCount} edges)`).join(" and ");
     const left = r.flagged.length ? ` ${r.flagged.length} edges left out.` : "";
-    await physcad.ui.toast(`Made ${names} with ${toolLabel(t)}.${left} Check it in simulation before cutting.`, r.flagged.length ? "info" : "success");
-    return { ops, edgeCount: r.edges.length, units: r.units, tool: toolLabel(t), skipped: r.skipped, flagged: r.flagged, partial: r.partial };
+    const rough = r.uneven ? ` ${r.uneven} edges will have an uneven break.` : "";
+    await physcad.ui.toast(`Made ${names} with ${toolLabel(t)}.${rough}${left} Check it in simulation before cutting.`, r.flagged.length || r.uneven ? "info" : "success");
+    return { ops, edgeCount: r.edges.length, uneven: r.uneven, edges: r.edges, units: r.units, width, tool: toolLabel(t), skipped: r.skipped, flagged: r.flagged, partial: r.partial };
   },
 });
 
-// Edges the person picks, any shape: one Path operation, after the same checks.
+// Edges the person picks, any shape: one Path operation. Every picked edge is cut; the checks
+// only say which of them have a problem (keepFlagged: false leaves those out).
 physcad.commands.register({
   id: "deburrSelected",
   title: "Deburr selected edges",
-  description: "Add a Path operation that chamfers the edges picked in the view (any shape, wavy in 3D too) with a pointed tool, its tip `width` mm below each edge. Each edge gets the same check as findEdges' 3D edges; the ones that fail are left out and listed in flagged unless keepFlagged. width default 0.25; tolerance percent (default 20); passes 1-10 (default 1); tool: library tool number or id. edges: [{body, edge}] instead of the picks.",
+  description: "Add a Path operation that chamfers the edges picked in the view (any shape, wavy in 3D too) with a pointed tool, its tip `width` mm below each edge. Every picked edge is cut. Each gets the same check as findEdges' 3D edges, and the ones that fail (uneven width, the tool gouging or hitting the part, an inside corner, an edge facing down) are listed in flagged with why; keepFlagged: false leaves those out. width default 0.25; tolerance percent (default 20); passes 1-10 (default 1); tool: library tool number or id. edges: [{body, edge}] instead of the picks.",
   params: {
     type: "object",
     properties: {
@@ -622,11 +627,11 @@ physcad.commands.register({
       passes: { type: "integer" },
       tool: { type: ["number", "string"] },
       edges: { type: "array", items: { type: "object", properties: { body: { type: "string" }, edge: { type: "string" } }, required: ["body", "edge"] } },
-      keepFlagged: { type: "boolean", description: "Cut the edges that fail the check too (default false)" },
+      keepFlagged: { type: "boolean", description: "Cut the edges that fail the check too (default true)" },
     },
     additionalProperties: false,
   },
-  async run({ width = DEFAULT_WIDTH, tolerance = DEFAULT_TOL, passes = 1, tool, edges, keepFlagged = false } = {}) {
+  async run({ width = DEFAULT_WIDTH, tolerance = DEFAULT_TOL, passes = 1, tool, edges, keepFlagged = true } = {}) {
     if (!(width > 0)) throw new Error("The chamfer width must be more than 0");
     if (!(tolerance > 0)) throw new Error("The tolerance must be more than 0");
     checkPasses(passes);
@@ -646,7 +651,7 @@ physcad.commands.register({
       }
       const e = edgesOf[p.body][p.edge];
       const flag = (why, reason, extra) => { flagged.push({ ...p, why, reason, ...extra }); if (keepFlagged) keep.push(p); };
-      if (!e) { flag("unknown", "not found on the part"); continue; }
+      if (!e) { flagged.push({ ...p, why: "unknown", reason: "not found on the part" }); continue; }
       const c = await classifyEdge(p.body, e, zAxis, 0);
       if (!c.ok) { flag("shape", c.reason); continue; }
       const g = await cutCheck(p.body, p.edge, c.data, t, width, zAxis);
@@ -660,9 +665,9 @@ physcad.commands.register({
       throw new Error(`None of the ${picks.length} picked edges can be cut cleanly with ${toolLabel(t)}: ${[...new Set(flagged.map((f) => f.reason))].join("; ")}.`);
     }
     const r = await makePathOp(info.setup.id, keep, t, width, passes);
-    const left = flagged.length && !keepFlagged ? ` Left out ${flagged.length}.` : "";
+    const left = !flagged.length ? "" : keepFlagged ? ` ${flagged.length} of them have a problem.` : ` Left out ${flagged.length}.`;
     await physcad.ui.toast(`${r.name}: ${keep.length} edges with ${toolLabel(t)}.${left} Check it in simulation before cutting.`, flagged.length ? "info" : "success");
-    return { ...r, units: doc.units || "mm", tool: toolLabel(t), edges: keep, flagged };
+    return { ...r, units: doc.units || "mm", tool: toolLabel(t), edges: keep, flagged, keptFlagged: keepFlagged };
   },
 });
 

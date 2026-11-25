@@ -11,9 +11,11 @@
 </style>
 <p class="cam-warn" id="camWarn" hidden>3D Deburr works in the CAM workspace. Switch to CAM and open a setup to use it.</p>
 <p class="note">Breaks the sharp outside edges you can reach from above in the open setup. Check the result in simulation before cutting.</p>
+<p class="note">For now the break on a wavy or sloped edge is not an even width: the toolpath runs at one depth. An even break is waiting on a PhysCAD feature.</p>
 <div class="prop"><label title="How wide the chamfer is on each edge. Type a unit (e.g. 0.5 mm) to use a different unit than the document.">Width</label><pc-number id="width" kind="length" value="0.25" min="0.01"></pc-number></div>
 <div class="prop"><label title="Split the chamfer into this many cuts, each a little deeper. Use more passes for a wide chamfer or hard material.">Passes</label><pc-number id="passes" kind="count" value="1" min="1" max="10" step="1"></pc-number></div>
-<div class="prop"><label title="How far the cut width on a wavy or sloped edge may differ from Width, in percent, before that edge is left out. Smaller is stricter.">Tolerance %</label><pc-number id="tolerance" kind="count" value="20" min="1" max="500" step="1"></pc-number></div>
+<div class="prop"><label title="How far the cut width on a wavy or sloped edge may differ from Width, in percent, before that edge counts as uneven. Smaller is stricter.">Tolerance %</label><pc-number id="tolerance" kind="count" value="20" min="1" max="500" step="1"></pc-number></div>
+<div class="prop"><label title="Also deburr wavy or sloped edges whose break will not be an even width (outside Tolerance %). The message below gives the widths. Off leaves those edges out. Edges the tool would gouge or collide on are always left out.">Uneven edges</label><input id="keepUneven" type="checkbox" checked></div>
 <div class="prop"><label title="Tool number from your library. Leave blank to use a chamfer mill or spot drill, one this setup already uses if it can. The message below names the tool chosen.">Tool #</label><input id="tool" type="text" size="6" placeholder="auto"></div>
 
 <p class="note"><b>Auto</b></p>
@@ -40,7 +42,7 @@
   <button id="pickClear" title="Unpick all edges.">Clear picks</button>
 </div>
 <p class="note">Pick mode on: click edges to add them, click a picked edge to remove it. No Shift key needed.</p>
-<div class="actions"><button class="primary" id="picked" title="Make a toolpath that follows the edges you picked, even wavy 3D ones. Edges the tool can't cut cleanly within the tolerance are left out.">Deburr selected edges</button></div>
+<div class="actions"><button class="primary" id="picked" title="Make a toolpath that follows the edges you picked, even wavy 3D ones. Every picked edge is cut. The message below lists the ones with a problem: an uneven break, or the tool cutting into or hitting the part. Check those in simulation.">Deburr selected edges</button></div>
 
 <p class="note" id="status"></p>
 <div id="tip"></div>

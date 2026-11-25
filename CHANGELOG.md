@@ -1,5 +1,21 @@
 # Changelog
 
+## 3d-deburr 0.6.4 (2026-11-25)
+
+The plugin now cuts wavy edges instead of refusing them. Until this version it left out any wavy or sloped edge it could not break at an even width, which on the wavy test part was five of the six top edges, so in practice it did very little. Now Find edges and Create deburr include those edges, and Deburr selected edges cuts every edge you pick.
+
+The break on those edges is not an even width, and that is the known problem. PhysCAD's Path toolpath runs the tool's point straight below the edge at one fixed depth. That only gives an even break where the edge is level and the faces beside it are a flat top and a straight wall. Where the edge climbs or the faces lean, the same depth cuts wider or narrower: on the test part, asking for 0.25 mm gives 0.21 to 0.65 mm. The panel says how wide each group of edges will cut, so the result is no surprise.
+
+The fix is waiting on PhysCAD. An even break needs the tool to move up, down and a little sideways as it follows the edge, and a plugin cannot yet give PhysCAD a path like that. PhysCAD's developer has been asked for a way to hand a Path toolpath the exact tool positions to follow. The plugin already works out the depth needed at each point. When that lands, the uneven breaks go away. Until then, check every deburr toolpath in simulation before cutting; PhysCAD shows in red where a Path toolpath cuts into the part.
+
+- Find edges and Create deburr keep 3D edges whose only fault is an uneven cut width. They are marked `uneven: true` and counted in `uneven`. New `keepUneven` option (default true) and an Uneven edges checkbox in the panel; off leaves them out as before.
+- Find edges and Create deburr still leave out an edge that climbs too steeply for the tool, where the tool would cut a groove, hit a nearby face or dig into a face beside the edge.
+- Deburr selected edges cuts every picked edge, including ones where the tool gouges or hits the part, inside corners and edges that face down. `keepFlagged` now defaults to true; false leaves the failed edges out. The edges with a problem are still listed with the reason, and Show left out highlights them. A picked edge that is not on the part is skipped.
+- The panel message gives the cut widths of the even and the uneven 3D edges separately, and Create deburr reports them too.
+- The panel has a note that the break on wavy edges is uneven for now.
+- README has a section on the problem and what it is waiting on.
+- Tested on the wavy test part: Find edges returns all six top edges (five uneven); Deburr selected edges made one Path toolpath on seven picked edges, one of them an inside corner. Not tested: Create deburr, and the panel on screen.
+
 ## 3d-deburr 0.6.3 (2026-11-25)
 
 Find edges is faster. On the wavy test part it now takes about 3.4 seconds, down from about 7 seconds on the same PhysCAD version, and it finds exactly the same edges with exactly the same cut widths as before. (An older measurement of 48 seconds no longer holds: PhysCAD itself has become much faster at answering the plugin's questions about curved surfaces.)

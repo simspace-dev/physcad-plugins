@@ -11,9 +11,10 @@ physcad.storage.get("panel").then((v) => {
   if (typeof v.tool === "string") tool.value = v.tool;
   if (typeof v.skipModeled === "boolean") skipModeled.checked = v.skipModeled;
   if (typeof v.skipHoles === "boolean") skipHoles.checked = v.skipHoles;
+  if (typeof v.keepUneven === "boolean") $("keepUneven").checked = v.keepUneven;
 });
 function save() {
-  const v = { tool: tool.value, skipModeled: skipModeled.checked, skipHoles: skipHoles.checked };
+  const v = { tool: tool.value, skipModeled: skipModeled.checked, skipHoles: skipHoles.checked, keepUneven: $("keepUneven").checked };
   for (const k of SAVED) v[k] = Number($(k).value);
   return physcad.storage.set("panel", v);
 }
@@ -31,6 +32,7 @@ const findOpts = () => ({
   skipHoles: skipHoles.checked,
   holeMin: Number(holeMin.value),
   holeMax: Number(holeMax.value),
+  keepUneven: $("keepUneven").checked,
 });
 
 // A length in the document's units (the plugin works in mm).
@@ -44,8 +46,11 @@ function widthText(r) {
     const w = list.map((e) => e.cutWidth).filter(Boolean);
     return w.length ? `${fmt(Math.min(...w.map((x) => x[0])), r.units)} to ${fmt(Math.max(...w.map((x) => x[1])), r.units)}` : "";
   };
-  const kept = span((r.edges || []).filter((e) => e.kind !== "level")), left = span(r.flagged || []);
-  return (kept ? ` 3D edges cut ${kept} wide.` : "") + (left ? ` The left-out ones would cut ${left} wide.` : "");
+  const wavy = (r.edges || []).filter((e) => e.kind !== "level");
+  const kept = span(wavy.filter((e) => !e.uneven)), rough = span(wavy.filter((e) => e.uneven)), left = span(r.flagged || []);
+  return (kept ? ` Even 3D edges cut ${kept} wide.` : "")
+    + (rough ? ` ${r.uneven} uneven 3D edges cut ${rough} wide (you asked for ${fmt(r.width, r.units)}).` : "")
+    + (left ? ` The left-out ones would cut ${left} wide.` : "");
 }
 function leftOutText(r) {
   const n = (r.flagged || []).length + (r.partial || []).length;
@@ -80,13 +85,14 @@ $("find").addEventListener("click", () => busy($("find"), async () => {
 
 $("make").addEventListener("click", () => busy($("make"), async () => {
   const r = await physcad.commands.run("createDeburr", { ...findOpts(), ...common(), wallClear: Number($("wallClear").value) });
-  status.textContent = `Made ${r.ops.map((o) => `${o.name} on ${o.edgeCount} edges`).join(" and ")} with ${r.tool}.` + skippedText(r.skipped) + leftOutText(r);
+  status.textContent = `Made ${r.ops.map((o) => `${o.name} on ${o.edgeCount} edges`).join(" and ")} with ${r.tool}.` + widthText(r) + skippedText(r.skipped) + leftOutText(r);
 }));
 
 $("picked").addEventListener("click", () => busy($("picked"), async () => {
   const r = await physcad.commands.run("deburrSelected", common());
   const why = [...new Set((r.flagged || []).map((f) => f.reason))].join("; ");
-  const left = why ? ` Left out ${r.flagged.length}: ${why}. Press Show left out to see them.` : "";
+  const n = (r.flagged || []).length;
+  const left = !why ? "" : r.keptFlagged ? ` ${n} of them have a problem: ${why}. Show left out highlights them.` : ` Left out ${n}: ${why}. Press Show left out to see them.`;
   status.textContent = `Made ${r.name} on ${r.edgeCount} picked edges with ${r.tool}.${left} Check it in simulation before cutting.`;
 }));
 
