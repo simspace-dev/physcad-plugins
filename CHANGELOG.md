@@ -1,5 +1,18 @@
 # Changelog
 
+## 3d-deburr 0.6.2 (2026-11-25)
+
+This version records a test and the decision that came out of it. Nothing changes in the panel or in the toolpaths the plugin creates.
+
+Most wavy edges are still left out, because PhysCAD's Path toolpath runs at one depth and an even break on a wavy edge needs the depth to change along the edge. On 2026-11-24 a way around that was tried: draw a curve for the toolpath to follow in place of the edge itself. It works only when the edge lies in a flat plane. PhysCAD's Path toolpath does not accept a curve drawn in 3D, and the steep pocket rim would also need the tool moved sideways. The decision is to wait for the requested PhysCAD feature and not build the workaround.
+
+To run that test, the developer command that works out the depth at each point of an edge can now also report where the tool tip would be and how wide a break those positions would cut.
+
+- `evenDepth` has a new `points` option. It returns the tip position at each point of the edge (world mm), whether the edge is a closed loop, and the break those positions would cut (`wouldCut`: width, cut on each face, and the steep, notch, digs and hit counts). It returns them only when every point of the edge has a workable depth.
+- `cutCheck` takes an optional list of depths, one per edge point, and checks the edge at those depths. Without it, it checks one depth everywhere, as before.
+- `nearFaceHits` uses the same per-point depths when they are given.
+- CLAUDE.md records the workaround test and the decision to wait for PhysCAD.
+
 ## 3d-deburr 0.6.1 (2026-11-24)
 
 The plugin now has a license. Until now the code was public to read, but nobody else had the legal right to reuse it. It is now under the MIT license, a short, standard license that lets anyone use, change and sell the code as long as the copyright notice stays with it. The reason is practical: PhysCAD's developer has been invited to build 3D deburring into PhysCAD itself using this code, and the license gives him clear, lasting permission to do so.

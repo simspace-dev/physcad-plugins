@@ -1,4 +1,4 @@
-// 3D Deburr (3-axis, version 0.6.1)
+// 3D Deburr (3-axis, version 0.6.2)
 // Finds sharp, outside (convex) edges on the open CAM setup's part that a tool coming down the
 // setup's Z axis can reach, on any kind of surface, checked at points all along each edge. Level
 // edges (a flat top over a vertical wall) get one 2D Chamfer operation; wavy or sloped (3D)
@@ -147,8 +147,17 @@ const STEEP = 0.98;         // of the slope at which the tool's side runs along 
 const NOTCH_SIN = 0.087;    // both faces facing up by more than this (about 5 degrees): a groove
 const NEAR_FACES_MAX = 60;
 
-async function cutCheck(body, key, d, tool, width, zAxis) {
-  const sh = toolShape(tool), D = width, n = d.pts.length;
+// depths: the tip's depth below the edge at each of d.pts (default: `width` everywhere, as the
+// Path op on edges cuts today).
+async function cutCheck(body, key, d, tool, width, zAxis, depths) {
+  const sh = toolShape(tool), n = d.pts.length;
+  const depthAt = (arc) => {
+    if (!depths) return width;
+    const span = d.closed ? n : n - 1, x = (arc / d.length) * span;
+    const i = Math.max(0, Math.min(span - 1, Math.floor(x))), f = Math.max(0, Math.min(1, x - i));
+    return depths[i] + (depths[(i + 1) % n] - depths[i]) * f;
+  };
+  const D = depths ? Math.max(...depths) : width;
   const every = Math.max(1, Math.ceil(n / CHECK_SAMPLES));
   const idx = [];
   for (let i = 0; i < n; i++) if (i % every === 0 || i === n - 1) idx.push(i);
@@ -157,7 +166,8 @@ async function cutCheck(body, key, d, tool, width, zAxis) {
   // Asked for every FETCH_STEP, then filled in between in straight pieces.
   const fCount = Math.max(2, Math.min(2000, Math.ceil(d.length / FETCH_STEP) + 1));
   const de = await run("inspect.edgePoints", { body, edge: key, count: fCount });
-  const fetched = de.points.map((s) => sub(s.point, scale(zAxis, D)));
+  const fSpan = d.closed ? de.points.length : de.points.length - 1;
+  const fetched = de.points.map((s, i) => sub(s.point, scale(zAxis, depthAt((i * d.length) / fSpan))));
   if (d.closed) fetched.push(fetched[0]);
   const sub_n = Math.max(1, Math.round((d.length / (fetched.length - 1)) / DENSE_STEP));
   const tipsAll = [];
@@ -229,7 +239,7 @@ async function cutCheck(body, key, d, tool, width, zAxis) {
   };
   const cutA = await faceCut(d.faces[0], d.intoA);
   const cutB = await faceCut(d.faces[1], d.intoB);
-  const hits = await nearFaceHits(body, d, idx, sh, D, zAxis);
+  const hits = await nearFaceHits(body, d, idx, sh, D, zAxis, depths);
 
   const count = { steep: 0, notch: 0, digs: 0 }, at = {};
   const mark = (why, i) => { count[why]++; if (!at[why]) at[why] = d.pts[i]; };
@@ -258,11 +268,11 @@ async function cutCheck(body, key, d, tool, width, zAxis) {
 // Faces near the edge that end up inside the tool. Points up the tool's axis are dropped onto
 // each nearby face; a face point well inside the tool there is a hit. (The two faces of the
 // edge itself are let in as far as the chamfer goes.)
-async function nearFaceHits(body, d, idx, sh, D, zAxis) {
+async function nearFaceHits(body, d, idx, sh, D, zAxis, depths) {
   const height = sh.coneHeight + 2 * sh.R;
   const fr = [0.05, 0.12, 0.25, 0.45, 0.7, 1];
   const stride = Math.max(1, Math.ceil(idx.length / HIT_SAMPLES));
-  const tips = idx.filter((_, j) => j % stride === 0 || j === idx.length - 1).map((i) => sub(d.pts[i], scale(zAxis, D)));
+  const tips = idx.filter((_, j) => j % stride === 0 || j === idx.length - 1).map((i) => sub(d.pts[i], scale(zAxis, depths ? depths[i] : D)));
   const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
   for (const t of tips) for (const p of [t, add(t, scale(zAxis, height))]) for (let k = 0; k < 3; k++) {
     min[k] = Math.min(min[k], p[k] - sh.R - 0.5); max[k] = Math.max(max[k], p[k] + sh.R + 0.5);
@@ -611,8 +621,8 @@ physcad.commands.register({
   id: "evenDepth",
   title: "Even-width depths",
   description: "For one edge: how deep below the edge the tool tip must go at each point for a bevel exactly `width` wide, and the cut on each face that gives. tooSteep: points where no depth works with this tool.",
-  params: { type: "object", properties: { body: { type: "string" }, edge: { type: "string" }, width: { type: "number" }, tool: { type: ["number", "string"] } }, required: ["body", "edge"] },
-  async run({ body, edge, width = DEFAULT_WIDTH, tool } = {}) {
+  params: { type: "object", properties: { body: { type: "string" }, edge: { type: "string" }, width: { type: "number" }, tool: { type: ["number", "string"] }, points: { type: "boolean", description: "Also return the tip positions (world mm) and the bevel width those positions would cut" } }, required: ["body", "edge"] },
+  async run({ body, edge, width = DEFAULT_WIDTH, tool, points = false } = {}) {
     const info = await openSetup();
     const zAxis = unit(info.geometry.axes.z);
     const t = await pickTool(tool, info);
@@ -625,11 +635,19 @@ physcad.commands.register({
     const ok = r.filter((x) => x.depth !== null);
     const r3 = (x) => Math.round(x * 1000) / 1000;
     const range = (xs) => (xs.length ? [r3(Math.min(...xs)), r3(Math.max(...xs))] : null);
-    return {
+    const out = {
       tool: toolLabel(t), points: r.length, tooSteep: r.length - ok.length,
       depth: range(ok.map((x) => x.depth)),
       cutOnFaceA: range(ok.map((x) => x.legs[0])), cutOnFaceB: range(ok.map((x) => x.legs[1])),
     };
+    if (points && ok.length === r.length) {
+      const depths = r.map((x) => x.depth);
+      const g = await cutCheck(body, edge, d, t, width, zAxis, depths);
+      out.closed = d.closed;
+      out.wouldCut = { width: g.width, legs: g.legs, steep: g.steep, notch: g.notch, digs: g.digs, hits: g.hits.length };
+      out.tips = d.pts.map((p, i) => sub(p, scale(zAxis, depths[i])).map((x) => Math.round(x * 10000) / 10000));
+    }
+    return out;
   },
 });
 

@@ -2,7 +2,7 @@
 
 One folder per plugin. Plugins run in PhysCAD's plugin sandbox: one main file, no imports, lengths in mm, angles in degrees.
 
-## 3d-deburr — v0.6.1
+## 3d-deburr — v0.6.2
 
 Goal: a clean, consistent edge break on every sharp outside edge of a 3D part. A break whose width varies along the edge is not acceptable.
 
@@ -13,7 +13,7 @@ Goal: a clean, consistent edge break on every sharp outside edge of a 3D part. A
 - Wavy test part, 0.25 mm, T5 1/4" 90° chamfer mill: only the hole rim passes; the other five top edges are 0.21–0.65 mm and are left out.
 
 ### Blocked on PhysCAD
-A Path op can't follow a path the plugin computes (one depth only, tip on the edge). Requested: an optional `points` field on `cam.op.trace` (chains of 3D tip positions), plus `source` edges and an `allowedCut` for the edge-gouge warning. `evenDepths()` already computes the depth per point. When it lands: build the tip path (depth, then a sideways shift so the flank cuts, not the tip), add ball end mills, partial edges.
+A Path op can't follow a path the plugin computes (one depth only, tip on the edge). Workaround tried 2026-11-24: a flat sketch spline the Path op follows works only for an edge lying in a flat plane; 3D splines (`spline3d.create`) are not accepted by `cam.op.trace`, and the steep pocket rim also needs a sideways shift. Decision: wait for PhysCAD, do not build the workaround. Requested: an optional `points` field on `cam.op.trace` (chains of 3D tip positions), plus `source` edges and an `allowedCut` for the edge-gouge warning. `evenDepths()` already computes the depth per point. When it lands: build the tip path (depth, then a sideways shift so the flank cuts, not the tip), add ball end mills, partial edges.
 
 ### Next (not blocked)
 1. Speed: Find edges takes ~48 s on the wavy test part (`inspect.surfaceNormals` on spline faces is slow). Skip the check for plane/plane edges, cache per edge.
