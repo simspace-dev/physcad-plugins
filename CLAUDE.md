@@ -2,7 +2,7 @@
 
 One folder per plugin. Plugins run in PhysCAD's plugin sandbox: one main file, no imports, lengths in mm, angles in degrees.
 
-## 3d-deburr — v0.6.2
+## 3d-deburr — v0.6.3
 
 Goal: a clean, consistent edge break on every sharp outside edge of a 3D part. A break whose width varies along the edge is not acceptable.
 
@@ -16,7 +16,7 @@ Goal: a clean, consistent edge break on every sharp outside edge of a 3D part. A
 A Path op can't follow a path the plugin computes (one depth only, tip on the edge). Workaround tried 2026-11-24: a flat sketch spline the Path op follows works only for an edge lying in a flat plane; 3D splines (`spline3d.create`) are not accepted by `cam.op.trace`, and the steep pocket rim also needs a sideways shift. Decision: wait for PhysCAD, do not build the workaround. Requested: an optional `points` field on `cam.op.trace` (chains of 3D tip positions), plus `source` edges and an `allowedCut` for the edge-gouge warning. `evenDepths()` already computes the depth per point. When it lands: build the tip path (depth, then a sideways shift so the flank cuts, not the tip), add ball end mills, partial edges.
 
 ### Next (not blocked)
-1. Speed: Find edges takes ~48 s on the wavy test part (`inspect.surfaceNormals` on spline faces is slow). Skip the check for plane/plane edges, cache per edge.
+1. Speed (done in 0.6.3): Find edges takes ~3.4 s on the wavy test part, ~0.03 s when repeated (was ~7 s on PhysCAD 0.9.20, ~48 s before). `cutCheck` finds each cut's end by halving, face sides are probed at a few points, results are cached per edge until the body or setup direction changes. `findEdges` returns `timing`. What is left is mostly `nearFaceHits`.
 2. Test on a real part: Create deburr from the panel, Show left out, the level-edge rule.
 3. Holder and shank check.
 4. Waiting on PhysCAD: a `workspace` option for toolbar buttons / a `workspaceChanged` event (would replace the 2 s `cam.setups` polling in panel.js).

@@ -1,5 +1,20 @@
 # Changelog
 
+## 3d-deburr 0.6.3 (2026-11-25)
+
+Find edges is faster. On the wavy test part it now takes about 3.4 seconds, down from about 7 seconds on the same PhysCAD version, and it finds exactly the same edges with exactly the same cut widths as before. (An older measurement of 48 seconds no longer holds: PhysCAD itself has become much faster at answering the plugin's questions about curved surfaces.)
+
+A second search is close to instant. The plugin now remembers what it worked out for each edge, so pressing Create deburr right after Find edges no longer repeats the whole search. It forgets those results as soon as the part changes or the setup points a different way, so a changed part is always checked again.
+
+- `cutCheck` finds where each face leaves the tool by halving the distance, about 5 surface lookups per point where it used to make 16 or more. A face still inside the tool at the last step is reported as digging in, as before.
+- Which side of an edge a face lies on is tried at every sixth point first, and at every point only when those disagree.
+- An edge that is too smooth to need a deburr is dropped before any of that is asked. The side of the first face is only worked out for edges that pass.
+- Results are kept per edge until the body (its faces, edges and size) or the setup's tool direction changes. The search reports how many edges it reused.
+- `findEdges` returns `timing`: the total time and, for each PhysCAD command, how many calls, how many points and how long.
+- Surface lookups are made one at a time; two used to run together in places.
+- Test part: 14,156 surface points asked before, 7,360 now. A repeat search takes about 0.03 seconds. `evenDepth` on the pocket rim still gives 0.097 to 0.303 mm.
+- Not run after this change: Create deburr and Deburr selected (they add toolpaths to the open file).
+
 ## 3d-deburr 0.6.2 (2026-11-25)
 
 This version records a test and the decision that came out of it. Nothing changes in the panel or in the toolpaths the plugin creates.

@@ -1,4 +1,4 @@
-// 3D Deburr (3-axis, version 0.6.2)
+// 3D Deburr (3-axis, version 0.6.3)
 // Finds sharp, outside (convex) edges on the open CAM setup's part that a tool coming down the
 // setup's Z axis can reach, on any kind of surface, checked at points all along each edge. Level
 // edges (a flat top over a vertical wall) get one 2D Chamfer operation; wavy or sloped (3D)
@@ -17,7 +17,17 @@ const len = (a) => Math.sqrt(dot(a, a));
 const unit = (a) => { const l = len(a); return l > 1e-12 ? scale(a, 1 / l) : null; };
 const deg = (r) => (r * 180) / Math.PI;
 
-const run = (name, args) => physcad.commands.run(name, args || {});
+// Every PhysCAD command goes through here, and is timed (findEdges reports the totals).
+let callStats = {};
+const run = async (name, args) => {
+  const t0 = Date.now();
+  try { return await physcad.commands.run(name, args || {}); }
+  finally {
+    const s = callStats[name] || (callStats[name] = { calls: 0, points: 0, ms: 0 });
+    s.calls++; s.ms += Date.now() - t0;
+    if (args && Array.isArray(args.points)) s.points += args.points.length;
+  }
+};
 
 // inspect.surfaceNormals for any number of points, asked for a batch at a time.
 const NORMALS_BATCH = 1500;
@@ -41,8 +51,8 @@ const FLAT_COS = 0.999;      // a face this square to the tool axis counts as fl
 const VERTICAL_SIN = 0.02;   // a face leaning less than this (about 1 degree) counts as vertical
 const DEFAULT_TOL = 20;      // percent the cut width may differ from the width asked for
 
-// Points all along an edge, with both faces' outward directions there and the direction each
-// face runs away from the edge (square to it, along the face).
+// Points all along an edge, with both faces' outward directions there. The direction each face
+// runs away from the edge is added by addInto, only for the edges that need it.
 async function sampleEdge(body, key, faces, length) {
   const [faceA, faceB] = faces;
   const count = Math.max(5, Math.min(MAX_SAMPLES, Math.ceil((length || 0) / SAMPLE_STEP) + 1));
@@ -50,24 +60,36 @@ async function sampleEdge(body, key, faces, length) {
   const samples = (ep && ep.points) || [];
   if (samples.length < 2) return null;
   const pts = samples.map((s) => s.point), tangents = samples.map((s) => unit(s.tangent) || [0, 0, 0]);
-  const [ra, rb] = await Promise.all([
-    run("inspect.surfaceNormals", { body, face: faceA, points: pts }),
-    run("inspect.surfaceNormals", { body, face: faceB, points: pts }),
-  ]);
+  const ra = await run("inspect.surfaceNormals", { body, face: faceA, points: pts });
+  const rb = await run("inspect.surfaceNormals", { body, face: faceB, points: pts });
   const nA = ra.points.map((r) => unit(r.normal)), nB = rb.points.map((r) => unit(r.normal));
-  // Step both ways across each face, square to the edge: the step that stays on the face is
-  // the one into it.
-  const intoOf = async (face, n) => {
-    const across = tangents.map((t, i) => (n[i] && unit(cross(t, n[i]))) || [0, 0, 0]);
-    const probes = [];
-    pts.forEach((p, i) => { probes.push(add(p, scale(across[i], PROBE)), sub(p, scale(across[i], PROBE))); });
-    const r = await run("inspect.surfaceNormals", { body, face, points: probes });
-    return across.map((a, i) => (r.points[2 * i].distance <= r.points[2 * i + 1].distance ? a : scale(a, -1)));
-  };
-  const [intoA, intoB] = await Promise.all([intoOf(faceA, nA), intoOf(faceB, nB)]);
   const closed = !!ep.closed, span = closed ? samples.length : samples.length - 1;
   const arc = pts.map((_, i) => (i * ep.length) / span);   // how far along the edge each point is
-  return { faces, length: ep.length, closed, pts, tangents, nA, nB, intoA, intoB, arc };
+  return { body, faces, length: ep.length, closed, pts, tangents, nA, nB, intoA: null, intoB: null, arc };
+}
+
+// The direction face A or B ("A" | "B") runs away from the edge at each point: square to the
+// edge, along the face. Step both ways across the face: the step that stays on it is the one
+// into it. A face lies on one side of its edge all the way along, so a few points are tried
+// first, and every point only when those disagree.
+const INTO_EVERY = 6;
+async function addInto(d, which) {
+  if (d["into" + which]) return;
+  const face = d.faces[which === "A" ? 0 : 1], n = which === "A" ? d.nA : d.nB;
+  const across = d.tangents.map((t, i) => (n[i] && unit(cross(t, n[i]))) || [0, 0, 0]);
+  const sideAt = async (list) => {
+    const probes = [];
+    for (const i of list) probes.push(add(d.pts[i], scale(across[i], PROBE)), sub(d.pts[i], scale(across[i], PROBE)));
+    const r = await run("inspect.surfaceNormals", { body: d.body, face, points: probes });
+    return list.map((_, k) => (r.points[2 * k].distance <= r.points[2 * k + 1].distance ? 1 : -1));
+  };
+  const all = d.pts.map((_, i) => i);
+  const few = all.filter((i) => i % INTO_EVERY === 0 || i === all.length - 1);
+  const fewSide = await sideAt(few);
+  let side;
+  if (fewSide.every((x) => x === fewSide[0])) side = all.map(() => fewSide[0]);
+  else side = await sideAt(all);
+  d["into" + which] = across.map((a, i) => (side[i] > 0 ? a : scale(a, -1)));
 }
 
 // Classify one edge by checking it at points all along its length, on any kind of surface.
@@ -77,17 +99,19 @@ async function classifyEdge(body, edge, zAxis, minAngle) {
   if (!edge.faces || edge.faces.length !== 2) return { ok: false, reason: "not between two faces" };
   const d = await sampleEdge(body, edge.key, edge.faces, edge.length);
   if (!d) return { ok: false, reason: "could not sample the edge" };
-  const { pts, nA, nB, intoB } = d;
+  const { pts, nA, nB } = d;
+  if (pts.some((_, i) => !nA[i] || !nB[i])) return { ok: false, reason: "face data missing" };
 
-  let minA = 180, smooth = 0, inside = 0, down = 0;
-  for (let i = 0; i < pts.length; i++) {
-    if (!nA[i] || !nB[i]) return { ok: false, reason: "face data missing" };
-    const a = deg(Math.acos(clamp1(dot(nA[i], nB[i]))));
-    minA = Math.min(minA, a);
-    if (a < minAngle) { smooth++; continue; }               // too gentle here to need a deburr
-    if (!(dot(intoB[i], nA[i]) < -1e-3)) { inside++; continue; } // B folds up in front of A: inside corner
-    const bis = unit(add(nA[i], nB[i]));
-    if (!bis || dot(bis, zAxis) < 0.05) down++;              // the corner faces down or sideways
+  const angles = pts.map((_, i) => deg(Math.acos(clamp1(dot(nA[i], nB[i])))));
+  const minA = Math.min(...angles), smooth = angles.filter((a) => a < minAngle).length;   // too gentle to need a deburr
+  let inside = 0, down = 0;
+  if (!smooth) {
+    await addInto(d, "B");
+    for (let i = 0; i < pts.length; i++) {
+      if (!(dot(d.intoB[i], nA[i]) < -1e-3)) { inside++; continue; } // B folds up in front of A: inside corner
+      const bis = unit(add(nA[i], nB[i]));
+      if (!bis || dot(bis, zAxis) < 0.05) down++;              // the corner faces down or sideways
+    }
   }
   const n = pts.length, angle = minA;
   const fail = (k, why) => ({ ok: false, reason: (k === n ? "" : "partly ") + why, partial: k !== n, angle });
@@ -103,6 +127,7 @@ async function classifyEdge(body, edge, zAxis, minAngle) {
     const a = dot(nA[i], zAxis), b = dot(nB[i], zAxis);
     return (a > FLAT_COS && Math.abs(b) < VERTICAL_SIN) || (b > FLAT_COS && Math.abs(a) < VERTICAL_SIN);
   });
+  await addInto(d, "A");
   return { ok: true, kind: oneHeight && flatOverWall ? "level" : "3d", angle, data: d };
 }
 
@@ -206,36 +231,44 @@ async function cutCheck(body, key, d, tool, width, zAxis, depths) {
   for (let k = 1; k <= 16; k++) steps.push((4 * width * k) / 16);
   for (let k = 1; k <= 8; k++) steps.push(4 * width + ((reach - 4 * width) * k) / 8);
 
-  // Walk out across a face from each point: where does the face leave the tool? Most cuts end
-  // within 4 widths, so the far steps are only asked for where the near ones didn't settle it.
-  const near = steps.slice(0, 16), far = steps.slice(16);
+  // Out across a face from each point: where does the face leave the tool? The first step past
+  // that is found by halving (a face is inside the tool near the edge and outside further out),
+  // so each point costs a handful of lookups, not one per step. Most cuts end within 4 widths:
+  // that step is tried first.
+  const N = steps.length, FIRST = 15;
   const faceCut = async (face, into) => {
-    const walk = async (list, st, state) => {
-      const query = [];
-      for (const j of list) for (const s of st) query.push(add(d.pts[idx[j]], scale(into[idx[j]], s)));
-      const r = await normalsOf(body, face, query);
-      list.forEach((j, n) => {
-        const c = state[j], tips = tipsNear(idx[j]);
-        for (let k = 0; k < st.length && !c.done; k++) {
-          const rp = r.points[n * st.length + k];
-          // The step went off the face (a narrow face): the cut runs to its far side.
-          if (rp.distance > 0.01 + 0.2 * st[k]) { c.done = true; c.leg = c.prevS; c.at = c.prevQ; break; }
-          const m = deepest(rp.point, tips);
-          if (m <= 0) {
-            const f = c.prevM / Math.max(c.prevM - m, 1e-9);
-            c.done = true; c.leg = c.prevS + (st[k] - c.prevS) * f; c.at = add(c.prevQ, scale(sub(rp.point, c.prevQ), f));
-            break;
-          }
-          c.prevS = st[k]; c.prevM = m; c.prevQ = rp.point;
-        }
-      });
+    // lo: the furthest step known inside the tool (-1: the edge itself). hi: the nearest step
+    // known past it (N: none yet).
+    const state = idx.map((i) => {
+      const tips = tipsNear(i);
+      return { tips, lo: -1, loM: deepest(d.pts[i], tips), loQ: d.pts[i], hi: N, hiM: 0, hiQ: null, hiOff: false };
+    });
+    const nextStep = (c) => {
+      if (c.hi < N) return c.hi - c.lo > 1 ? (c.lo + c.hi) >> 1 : -1;
+      if (c.lo < FIRST) return FIRST;
+      return c.lo < N - 1 ? N - 1 : -1;                        // inside at the last step: the tool digs in
     };
-    const state = idx.map((i) => ({ done: false, leg: Infinity, at: null, prevS: 0, prevM: deepest(d.pts[i], tipsNear(i)), prevQ: d.pts[i] }));
-    const all = idx.map((_, j) => j);
-    await walk(all, near, state);
-    const open = all.filter((j) => !state[j].done);
-    if (open.length) await walk(open, far, state);          // still inside after that: the tool digs in
-    return state;
+    for (;;) {
+      const asks = [];
+      state.forEach((c, j) => { const k = nextStep(c); if (k >= 0) asks.push([j, k]); });
+      if (!asks.length) break;
+      const r = await normalsOf(body, face, asks.map(([j, k]) => add(d.pts[idx[j]], scale(into[idx[j]], steps[k]))));
+      asks.forEach(([j, k], n) => {
+        const c = state[j], rp = r.points[n];
+        // The step went off the face (a narrow face): the cut runs to its far side.
+        const off = rp.distance > 0.01 + 0.2 * steps[k];
+        const m = off ? 0 : deepest(rp.point, c.tips);
+        if (off || m <= 0) { c.hi = k; c.hiM = m; c.hiQ = rp.point; c.hiOff = off; }
+        else { c.lo = k; c.loM = m; c.loQ = rp.point; }
+      });
+    }
+    return state.map((c) => {
+      if (c.hi === N) return { leg: Infinity, at: null };
+      const s0 = c.lo < 0 ? 0 : steps[c.lo];
+      if (c.hiOff) return { leg: s0, at: c.loQ };
+      const f = c.loM / Math.max(c.loM - c.hiM, 1e-9);
+      return { leg: s0 + (steps[c.hi] - s0) * f, at: add(c.loQ, scale(sub(c.hiQ, c.loQ), f)) };
+    });
   };
   const cutA = await faceCut(d.faces[0], d.intoA);
   const cutB = await faceCut(d.faces[1], d.intoB);
@@ -365,11 +398,22 @@ const MODELED_MAX_ANGLE = 75;  // degrees
 
 let lastLeftOut = [];          // the edges the last search left out, for "Show left out"
 
+// What the last search worked out for each edge, kept while the body and the setup's direction
+// stay the same, so a second search (or Create right after Find) doesn't ask PhysCAD again.
+const edgeCache = {};          // body id -> { sig, classify: Map, cut: Map }
+function cacheFor(body, b, zAxis) {
+  const sig = JSON.stringify([b.massProps, b.faces, b.edges, zAxis]);
+  if (!edgeCache[body] || edgeCache[body].sig !== sig) edgeCache[body] = { sig, classify: new Map(), cut: new Map() };
+  return edgeCache[body];
+}
+
 async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = false, holeMin = 0, holeMax = 10, skipModeled = true, width = DEFAULT_WIDTH, tool, tolerance = DEFAULT_TOL } = {}) {
   if (!(minAngle >= 0 && minAngle < 180)) throw new Error("The minimum angle must be between 0 and 180");
   if (skipHoles && !(holeMax >= holeMin)) throw new Error("The largest hole size must be at least the smallest");
   if (!(width > 0)) throw new Error("The chamfer width must be more than 0");
   if (!(tolerance > 0)) throw new Error("The tolerance must be more than 0");
+  const started = Date.now();
+  callStats = {};
   const info = await openSetup();
   const zAxis = unit(info.geometry.axes.z);
   const bodies = info.setup.bodies || [info.setup.body];
@@ -379,12 +423,14 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
   try { t = await pickTool(tool, info); checkPointed(t, width); checkTool = t; }
   catch (e) { check = "off: " + e.message; }
   const found = [], skipped = {}, flagged = [], partial = [];
+  let reused = 0;
   const skip = (why) => { skipped[why] = (skipped[why] || 0) + 1; };
   for (const body of bodies) {
     const b = await run("inspect.body", { body, maxFaces: 100000 });
     const facesByName = {};
     for (const f of b.faces || []) facesByName[f.name] = f;
     const widths = faceWidths(b);
+    const cache = cacheFor(body, b, zAxis);
     for (const e of b.edges || []) {
       if (excluded.has(e.key) || excluded.has(edgeId(body, e.key))) { skip("excluded by you"); continue; }
       const faces = (e.faces || []).map((n) => facesByName[n]).filter(Boolean);
@@ -392,7 +438,9 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
         const hole = faces.find((f) => f.surface === "cylinder" && f.internal);
         if (hole && 2 * hole.radius >= holeMin && 2 * hole.radius <= holeMax) { skip("hole in the skipped size range"); continue; }
       }
-      const c = await classifyEdge(body, e, zAxis, minAngle);
+      const cKey = `${e.key} ${minAngle}`;
+      let c = cache.classify.get(cKey);
+      if (c) reused++; else { c = await classifyEdge(body, e, zAxis, minAngle); cache.classify.set(cKey, c); }
       if (!c.ok) {
         skip(c.reason);
         if (c.partial) partial.push({ body, edge: e.key, reason: c.reason });
@@ -401,7 +449,9 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
       if (skipModeled && c.angle < MODELED_MAX_ANGLE && faces.some((f) => widths[f.name] < MODELED_MAX_WIDTH)) { skip("already chamfered or rounded on the model"); continue; }
       const item = { body, edge: e.key, kind: c.kind, angle: Math.round(c.angle), length: Math.round(e.length * 100) / 100 };
       if (c.kind === "3d" && checkTool) {
-        const g = await cutCheck(body, e.key, c.data, checkTool, width, zAxis);
+        const gKey = `${e.key} ${minAngle} ${checkTool.tipAngle || 90} ${checkTool.diameter || 6} ${width}`;
+        let g = cache.cut.get(gKey);
+        if (!g) { g = await cutCheck(body, e.key, c.data, checkTool, width, zAxis); cache.cut.set(gKey, g); }
         const why = verdict(g, width, tolerance);
         item.cutWidth = g.width;
         if (why) {
@@ -415,7 +465,7 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
   }
   lastLeftOut = [...flagged, ...partial].map((x) => ({ body: x.body, edge: x.edge }));
   const doc = await docInfo();
-  return { setup: info.setup.id, units: doc.units || "mm", tool: t ? toolLabel(t) : null, check, edges: found, skipped, flagged, partial };
+  return { setup: info.setup.id, units: doc.units || "mm", tool: t ? toolLabel(t) : null, check, edges: found, skipped, flagged, partial, timing: { ms: Date.now() - started, reused, commands: callStats } };
 }
 
 // Pick a tool: the number or id given, else a chamfer mill / spot drill from the library.
@@ -631,6 +681,9 @@ physcad.commands.register({
     const e = (b.edges || []).find((x) => x.key === edge);
     if (!e) throw new Error(`No edge ${edge} on ${body}`);
     const d = await sampleEdge(body, edge, e.faces, e.length);
+    if (!d) throw new Error("Could not sample the edge");
+    await addInto(d, "A");
+    await addInto(d, "B");
     const r = evenDepths(d, t, width, zAxis);
     const ok = r.filter((x) => x.depth !== null);
     const r3 = (x) => Math.round(x * 1000) / 1000;
