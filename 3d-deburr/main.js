@@ -1,4 +1,4 @@
-// 3D Deburr (3-axis, version 0.6.5)
+// 3D Deburr (3-axis, version 0.6.6)
 // Finds sharp, outside (convex) edges on the open CAM setup's part that a tool coming down the
 // setup's Z axis can reach, on any kind of surface, checked at points all along each edge. Level
 // edges (a flat top over a vertical wall) get one 2D Chamfer operation; wavy or sloped (3D)
@@ -16,6 +16,7 @@ const scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
 const len = (a) => Math.sqrt(dot(a, a));
 const unit = (a) => { const l = len(a); return l > 1e-12 ? scale(a, 1 / l) : null; };
 const deg = (r) => (r * 180) / Math.PI;
+const r3 = (x) => Math.round(x * 1000) / 1000, r4 = (x) => Math.round(x * 10000) / 10000;
 
 // Every PhysCAD command goes through here, and is timed (findEdges reports the totals).
 // PhysCAD's modeling engine now and then stops on a question and restarts itself (nothing is
@@ -23,8 +24,18 @@ const deg = (r) => (r * 180) / Math.PI;
 let callStats = {}, engineRestarts = 0;
 const ENGINE_TRIES = 3, ENGINE_WAIT = 1500;   // ms before asking again (twice that the second time)
 const engineStopped = (e) => /engine stopped/i.test(String((e && e.message) || e));
+const ENGINE_GAVE_UP = "PhysCAD's modeling engine stopped while working on this and did not recover. Nothing was lost. Try again: edges already checked are not checked again.";
+const engineGaveUp = (e) => String((e && e.message) || e) === ENGINE_GAVE_UP;
 const pause = (ms) => new Promise((done) => (typeof setTimeout === "function" ? setTimeout(done, ms) : done()));
-const run = async (name, args) => {
+// One request at a time, even when two commands run at once (the panel's background checks
+// while Deburr is working): parallel requests stopped the modeling engine before.
+let lane = Promise.resolve();
+const run = (name, args) => {
+  const next = lane.then(() => runNow(name, args));
+  lane = next.catch(() => {});
+  return next;
+};
+const runNow = async (name, args) => {
   const t0 = Date.now();
   try {
     for (let attempt = 1; ; attempt++) {
@@ -33,7 +44,7 @@ const run = async (name, args) => {
         if (!engineStopped(e)) throw e;
         engineRestarts++;
         if (!name.startsWith("inspect.") || attempt >= ENGINE_TRIES) {
-          throw new Error("PhysCAD's modeling engine stopped while working on this and did not recover. Nothing was lost. Try again: edges already checked are not checked again.");
+          throw new Error(ENGINE_GAVE_UP);
         }
         await pause(ENGINE_WAIT * attempt);
       }
@@ -69,19 +80,82 @@ const DEFAULT_TOL = 20;      // percent the cut width may differ from the width 
 
 // Points all along an edge, with both faces' outward directions there. The direction each face
 // runs away from the edge is added by addInto, only for the edges that need it.
+//  dense: the edge every FETCH_STEP, [{ p, t, arc, side }], for tool positions. At a sharp corner
+//  inside the edge (the direction turns at once) there are two entries at the corner, one with
+//  the direction coming in (side -1) and one with the direction going out (side 1).
+//  corners: how far along the edge each of those corners is.
+//  pts: the points checked, every SAMPLE_STEP. None sits on a corner, where the faces have no
+//  one direction: the points beside a corner are CORNER_SIDE before and after it.
+const FETCH_STEP = 0.25;     // mm between the edge points asked of PhysCAD for tool positions
+const CORNER_ANGLE = 12;     // degrees the direction must turn between two of those to be a corner
+const CORNER_SIDE = 0.5;     // mm from a corner to the points checked beside it
+function findCorners(pts, closed, length) {
+  const n = pts.length, last = closed ? n : n - 1;
+  const turn = (k) => deg(Math.acos(clamp1(dot(pts[k].t, pts[(k + 1) % n].t))));
+  const turns = [];
+  for (let k = 0; k < last; k++) turns.push(turn(k));
+  const corners = [];                                          // [{ k, x, arc }]: between dense k and k + 1
+  for (let k = 0; k < last; k++) {
+    const before = closed ? turns[(k - 1 + last) % last] : k > 0 ? turns[k - 1] : 0;
+    const after = closed ? turns[(k + 1) % last] : k + 1 < last ? turns[k + 1] : 0;
+    if (!(turns[k] > CORNER_ANGLE && before < turns[k] / 3 && after < turns[k] / 3)) continue;
+    // Where the two straight runs meet.
+    const a = pts[k], b = pts[(k + 1) % n], gap = len(sub(b.p, a.p));
+    const w = sub(a.p, b.p), c = dot(a.t, b.t), den = 1 - c * c;
+    const along = den > 1e-9 ? Math.max(0, Math.min(gap, (c * dot(b.t, w) - dot(a.t, w)) / den)) : gap / 2;
+    const arcB = closed && k === n - 1 ? length : b.arc;
+    corners.push({ k, x: add(a.p, scale(a.t, along)), arc: Math.min(arcB, a.arc + along) });
+  }
+  return corners;
+}
 async function sampleEdge(body, key, faces, length) {
   const [faceA, faceB] = faces;
   const count = Math.max(5, Math.min(MAX_SAMPLES, Math.ceil((length || 0) / SAMPLE_STEP) + 1));
   const ep = await run("inspect.edgePoints", { body, edge: key, count });
   const samples = (ep && ep.points) || [];
   if (samples.length < 2) return null;
-  const pts = samples.map((s) => s.point), tangents = samples.map((s) => unit(s.tangent) || [0, 0, 0]);
+  const closed = !!ep.closed, span = closed ? samples.length : samples.length - 1, L = ep.length;
+  let at = samples.map((s, i) => ({ p: s.point, t: unit(s.tangent) || [0, 0, 0], arc: (i * L) / span }));
+
+  const fCount = Math.max(2, Math.min(2000, Math.ceil(L / FETCH_STEP) + 1));
+  const de = await run("inspect.edgePoints", { body, edge: key, count: fCount });
+  const fSpan = closed ? de.points.length : de.points.length - 1;
+  const fine = de.points.map((s, i) => ({ p: s.point, t: unit(s.tangent) || [0, 0, 0], arc: (i * L) / fSpan, side: 0 }));
+  const found = findCorners(fine, closed, L);
+  const dense = [];
+  fine.forEach((e, k) => {
+    dense.push(e);
+    const c = found.find((x) => x.k === k);
+    if (!c) return;
+    const next = fine[(k + 1) % fine.length];
+    if (len(sub(c.x, e.p)) < 1e-4) {                           // the corner is this point
+      c.arc = e.arc; e.side = -1;
+      dense.push({ p: e.p, t: next.t, arc: e.arc, side: 1 });
+    } else if (len(sub(c.x, next.p)) < 1e-4) {                 // the corner is the next point
+      c.arc = k === fine.length - 1 ? L : next.arc; next.side = 1;
+      dense.push({ p: next.p, t: e.t, arc: c.arc, side: -1 });
+    } else dense.push({ p: c.x, t: e.t, arc: c.arc, side: -1 }, { p: c.x, t: next.t, arc: c.arc, side: 1 });
+  });
+  const corners = found.map((c) => c.arc);
+  if (corners.length) {
+    // How far apart two places on the edge are, the short way round a closed one.
+    const apart = (a, b) => { const x = Math.abs(a - b); return closed ? Math.min(x, L - x) : x; };
+    at = at.filter((e) => corners.every((c) => apart(e.arc, c) > CORNER_SIDE * 0.9));
+    for (const c of corners) for (const dir of [-1, 1]) {
+      let want = c + dir * CORNER_SIDE;
+      if (closed) want = ((want % L) + L) % L; else if (want < 0 || want > L) continue;
+      let best = null;
+      for (const e of fine) if (!best || apart(e.arc, want) < apart(best.arc, want)) best = e;
+      if (best && apart(best.arc, c) > FETCH_STEP * 0.9 && !at.some((e) => Math.abs(e.arc - best.arc) < 1e-6)) at.push({ p: best.p, t: best.t, arc: best.arc });
+    }
+    at.sort((a, b) => a.arc - b.arc);
+  }
+  if (at.length < 2) return null;
+  const pts = at.map((e) => e.p), tangents = at.map((e) => e.t), arc = at.map((e) => e.arc);
   const ra = await run("inspect.surfaceNormals", { body, face: faceA, points: pts });
   const rb = await run("inspect.surfaceNormals", { body, face: faceB, points: pts });
   const nA = ra.points.map((r) => unit(r.normal)), nB = rb.points.map((r) => unit(r.normal));
-  const closed = !!ep.closed, span = closed ? samples.length : samples.length - 1;
-  const arc = pts.map((_, i) => (i * ep.length) / span);   // how far along the edge each point is
-  return { body, faces, length: ep.length, closed, pts, tangents, nA, nB, intoA: null, intoB: null, arc };
+  return { body, faces, length: L, closed, pts, tangents, nA, nB, intoA: null, intoB: null, arc, dense, corners };
 }
 
 // The direction face A or B ("A" | "B") runs away from the edge at each point: square to the
@@ -148,19 +222,96 @@ async function classifyEdge(body, edge, zAxis, minAngle) {
 }
 
 // ---------- the tool, as a shape ----------
+const isBall = (x) => /ball/i.test(x.type || "");
+// The tool as a shape, up from its tip: the cutting end (a cone or a ball, then its diameter up
+// to the end of the flutes), then what must never touch the part: the rest of the body, the
+// shank up to the holder, and the holder (PhysCAD gives it as stacked rings).
 function toolShape(tool) {
-  const half = ((tool.tipAngle || 90) / 2) * Math.PI / 180;
-  const tanH = Math.tan(half), R = (tool.diameter || 6) / 2;
-  return { tanH, R, coneHeight: R / tanH };
+  const R = (tool.diameter || 6) / 2, ball = isBall(tool);
+  const tanH = ball ? 1 : Math.tan(((tool.tipAngle || 90) / 2) * Math.PI / 180);
+  const coneHeight = ball ? R : R / tanH;
+  const cut = Math.max(tool.fluteLength || 0, coneHeight);
+  const upper = [];                                            // [{ from, to, r0, r1, part }]
+  const ring = (to, r0, r1, part) => {
+    const from = upper.length ? upper[upper.length - 1].to : cut;
+    if (to > from + 1e-6) upper.push({ from, to, r0, r1, part });
+  };
+  if (tool.bodyLength > cut) {
+    ring(Math.min(tool.bodyLength, Math.max(tool.shoulderLength || 0, cut)), R, R, "shank");
+    const rs = (tool.shankDiameter || tool.diameter || 6) / 2;
+    ring(tool.bodyLength, rs, rs, "shank");
+    let h = tool.bodyLength;
+    for (const g of (tool.holder && tool.holder.segments) || []) {
+      if (!(g.height > 0)) continue;
+      h += g.height;
+      ring(h, (g.lower || 0) / 2, (g.upper || 0) / 2, "holder");
+    }
+  }
+  const low = coneHeight + 2 * R;                              // always checked, whatever the tool's lengths
+  const top = upper.length ? Math.max(low, upper[upper.length - 1].to) : low;
+  // The tool's radius and part at a height above the tip.
+  const at = (h) => {
+    if (h < cut || !upper.length) return { r: R, part: h < cut ? "cutter" : "shank" };
+    for (const g of upper) if (h <= g.to) return { r: g.r0 + ((g.r1 - g.r0) * (h - g.from)) / (g.to - g.from), part: g.part };
+    return { r: 0, part: "none" };                             // above the holder
+  };
+  return { ball, tanH, R, coneHeight, cut, low, top, at, maxR: Math.max(R, ...upper.map((g) => Math.max(g.r0, g.r1))) };
 }
 const toolLabel = (t) => `T${t.number} ${(t.description || t.type || "").slice(0, 44)}`.trim();
 
-// How far inside the tool a point is, sideways (mm): positive inside, negative outside. The
-// tool is a cone on its tip, then a cylinder of its diameter above that.
+// How far inside the tool a point is (mm): positive inside, negative outside. A pointed tool is
+// a cone on its tip, then a cylinder of its diameter above that (measured sideways). A ball end
+// mill is a ball, then the cylinder (measured from the ball's centre, below it). Above the
+// flutes: the body, shank and holder, each at its own radius.
 function margin(q, tip, zAxis, sh) {
   const v = sub(q, tip), h = dot(v, zAxis);
   const r = len(sub(v, scale(zAxis, h)));
+  if (h >= sh.cut) return sh.at(h).r - r;
+  if (sh.ball) return h < sh.R ? sh.R - Math.sqrt(r * r + (h - sh.R) * (h - sh.R)) : sh.R - r;
   return h <= 0 ? -Math.max(r, -h) : Math.min(h * sh.tanH, sh.R) - r;
+}
+
+// Tip offsets (tip position minus edge point) given at d.pts, read anywhere along the edge:
+// (arc, the edge's direction there, side) -> offset. Each offset is split into up, across the
+// edge and along the edge (the last two level), and put back together with the edge's own
+// direction at the point asked for. So an offset that points out from the part keeps pointing
+// out from it where the edge turns between two of d.pts. Nothing is blended across a sharp
+// corner: up to the corner the offset is the last one before it, and after it the first one
+// after it (side says which, for a point on the corner itself).
+function offsetAlong(d, off, zAxis) {
+  const n = d.pts.length, A = d.arc, L = d.length, corners = d.corners || [];
+  const frame = (t) => {
+    const along = unit(sub(t, scale(zAxis, dot(t, zAxis))));
+    return along ? { along, across: cross(along, zAxis) } : null;      // null: the edge runs straight up
+  };
+  const parts = off.map((o, i) => {
+    const f = frame(d.tangents[i]);
+    return f ? [dot(o, zAxis), dot(o, f.across), dot(o, f.along)] : null;
+  });
+  // The two points checked either side of `arc`, and how far between them it is.
+  const locate = (arc) => {
+    if (d.closed && (arc < A[0] || arc >= A[n - 1])) {
+      const x = arc < A[0] ? arc + L : arc, a0 = A[n - 1], a1 = A[0] + L;
+      return { i: n - 1, k: 0, x, a0, a1 };
+    }
+    if (arc <= A[0]) return { i: 0, k: 0, x: A[0], a0: A[0], a1: A[0] };
+    if (arc >= A[n - 1]) return { i: n - 1, k: n - 1, x: A[n - 1], a0: A[n - 1], a1: A[n - 1] };
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (A[mid] <= arc) lo = mid; else hi = mid; }
+    return { i: lo, k: hi, x: arc, a0: A[lo], a1: A[hi] };
+  };
+  return (arc, tangent, side = 0) => {
+    const { i, k, x, a0, a1 } = locate(arc);
+    let f = a1 > a0 ? Math.max(0, Math.min(1, (x - a0) / (a1 - a0))) : 0;
+    for (const c0 of corners) for (const c of d.closed ? [c0, c0 + L] : [c0]) {
+      if (!(c > a0 && c < a1)) continue;
+      f = x < c - 1e-9 ? 0 : x > c + 1e-9 ? 1 : side > 0 ? 1 : 0;
+    }
+    const here = tangent && frame(unit(tangent) || [0, 0, 0]);
+    if (!here || !parts[i] || !parts[k]) return add(off[i], scale(sub(off[k], off[i]), f));
+    const c = [0, 1, 2].map((m) => parts[i][m] + (parts[k][m] - parts[i][m]) * f);
+    return add(add(scale(zAxis, c[0]), scale(here.across, c[1])), scale(here.along, c[2]));
+  };
 }
 
 // ---------- check of the Path toolpath on a 3D edge ----------
@@ -177,56 +328,59 @@ const REASONS = {
   steep: "climbs too steeply for this tool's point",
   notch: "both faces slope away from it (the tool would cut a groove)",
   hit: "the tool would hit another face nearby",
+  shank: "the tool's shank or holder would hit the part",
   digs: "the tool would dig into a steep face beside it",
   uneven: "the cut width would vary more than the tolerance",
+  size: "the width is too big for this tool there",
 };
 const CHECK_SAMPLES = 60;   // most points checked per edge
 const HIT_SAMPLES = 40;     // most points per edge checked against nearby faces
 const DENSE_STEP = 0.025;   // mm between the tool positions counted along the edge
-const FETCH_STEP = 0.25;    // mm between the edge points asked of PhysCAD for those positions
 const STEEP = 0.98;         // of the slope at which the tool's side runs along the edge
 const NOTCH_SIN = 0.087;    // both faces facing up by more than this (about 5 degrees): a groove
-const NEAR_FACES_MAX = 60;
+const NEAR_FACES_MAX = 200;   // most faces asked about per edge
 
-// depths: the tip's depth below the edge at each of d.pts (default: `width` everywhere, as the
-// Path op on edges cuts today).
-async function cutCheck(body, key, d, tool, width, zAxis, depths) {
+// offsets: where the tip is at each of d.pts, as tip minus edge point (default: `width` straight
+// below the edge everywhere, as the Path op on edges cuts today).
+async function cutCheck(body, key, d, tool, width, zAxis, offsets) {
   const sh = toolShape(tool), n = d.pts.length;
-  const depthAt = (arc) => {
-    if (!depths) return width;
-    const span = d.closed ? n : n - 1, x = (arc / d.length) * span;
-    const i = Math.max(0, Math.min(span - 1, Math.floor(x))), f = Math.max(0, Math.min(1, x - i));
-    return depths[i] + (depths[(i + 1) % n] - depths[i]) * f;
-  };
-  const D = depths ? Math.max(...depths) : width;
+  const off = offsets || d.pts.map(() => scale(zAxis, -width));
+  const offAt = offsetAlong(d, off, zAxis);
   const every = Math.max(1, Math.ceil(n / CHECK_SAMPLES));
   const idx = [];
   for (let i = 0; i < n; i++) if (i % every === 0 || i === n - 1) idx.push(i);
 
-  // Tool tip positions all along the edge, close together.
-  // Asked for every FETCH_STEP, then filled in between in straight pieces.
-  const fCount = Math.max(2, Math.min(2000, Math.ceil(d.length / FETCH_STEP) + 1));
-  const de = await run("inspect.edgePoints", { body, edge: key, count: fCount });
-  const fSpan = d.closed ? de.points.length : de.points.length - 1;
-  const fetched = de.points.map((s, i) => sub(s.point, scale(zAxis, depthAt((i * d.length) / fSpan))));
-  if (d.closed) fetched.push(fetched[0]);
-  const sub_n = Math.max(1, Math.round((d.length / (fetched.length - 1)) / DENSE_STEP));
-  const tipsAll = [];
-  for (let i = 0; i + 1 < fetched.length; i++) for (let k = 0; k < sub_n; k++) tipsAll.push(add(fetched[i], scale(sub(fetched[i + 1], fetched[i]), k / sub_n)));
-  if (!d.closed) tipsAll.push(fetched[fetched.length - 1]);
-  const dStep = d.length / (d.closed ? tipsAll.length : tipsAll.length - 1);
-  const win = Math.ceil(sh.R / dStep);
-  const endDir = [unit(de.points[0].tangent) || [0, 0, 0], unit(de.points[de.points.length - 1].tangent) || [0, 0, 0]];
+  // Tool tip positions all along the edge, close together: one at each of d.dense, then filled
+  // in between in straight pieces (at a sharp corner, the straight move from the tip position
+  // before it to the one after it). tipArc: how far along the edge each one is.
+  const fetched = d.dense.map((e) => ({ tip: add(e.p, offAt(e.arc, e.t, e.side)), arc: e.arc }));
+  if (d.closed) fetched.push({ tip: fetched[0].tip, arc: d.length });
+  const tipsAll = [], tipArc = [];
+  for (let i = 0; i + 1 < fetched.length; i++) {
+    const a = fetched[i], b = fetched[i + 1];
+    const m = Math.max(1, Math.round(Math.max(b.arc - a.arc, len(sub(b.tip, a.tip))) / DENSE_STEP));
+    for (let k = 0; k < m; k++) { tipsAll.push(add(a.tip, scale(sub(b.tip, a.tip), k / m))); tipArc.push(a.arc + ((b.arc - a.arc) * k) / m); }
+  }
+  if (!d.closed) { tipsAll.push(fetched[fetched.length - 1].tip); tipArc.push(d.length); }
+  const endDir = [d.dense[0].t, d.dense[d.dense.length - 1].t];
+  const firstAt = (x) => { let lo = 0, hi = tipArc.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (tipArc[mid] < x) lo = mid + 1; else hi = mid; } return lo; };
+  const reachAlong = Math.ceil(sh.R / DENSE_STEP) * DENSE_STEP + DENSE_STEP / 2;
+  // The tool positions within the tool's radius of point i, along the edge.
   const tipsNear = (i) => {
-    const c = Math.round(d.arc[i] / dStep), out = [];
-    for (let j = c - win; j <= c + win; j++) {
-      if (d.closed) out.push(tipsAll[((j % tipsAll.length) + tipsAll.length) % tipsAll.length]);
-      else if (j >= 0 && j < tipsAll.length) out.push(tipsAll[j]);
-      // Past an open edge's end the toolpath carries on (the next edge, or a lead in or out):
-      // take it as going straight on.
-      else if (j < 0) out.push(add(tipsAll[0], scale(endDir[0], j * dStep)));
-      else out.push(add(tipsAll[tipsAll.length - 1], scale(endDir[1], (j - tipsAll.length + 1) * dStep)));
+    const from = d.arc[i] - reachAlong, to = d.arc[i] + reachAlong, out = [];
+    const take = (a, b) => { for (let j = firstAt(a); j < tipArc.length && tipArc[j] <= b; j++) out.push(tipsAll[j]); };
+    if (d.closed) {
+      if (to - from >= d.length) return tipsAll;
+      take(from, to);
+      if (from < 0) take(from + d.length, d.length);
+      if (to > d.length) take(0, to - d.length);
+      return out;
     }
+    take(from, to);
+    // Past an open edge's end the toolpath carries on (the next edge, or a lead in or out):
+    // take it as going straight on.
+    for (let x = -DENSE_STEP; x >= from; x -= DENSE_STEP) out.push(add(tipsAll[0], scale(endDir[0], x)));
+    for (let x = d.length + DENSE_STEP; x <= to; x += DENSE_STEP) out.push(add(tipsAll[tipsAll.length - 1], scale(endDir[1], x - d.length)));
     return out;
   };
   // margin(), over many tips, without making arrays.
@@ -235,14 +389,16 @@ async function cutCheck(body, key, d, tool, width, zAxis, depths) {
     for (const t of tips) {
       const x = q[0] - t[0], y = q[1] - t[1], z = q[2] - t[2];
       const h = x * zAxis[0] + y * zAxis[1] + z * zAxis[2];
-      const r = Math.sqrt(Math.max(0, x * x + y * y + z * z - h * h));
-      const m = h <= 0 ? -Math.max(r, -h) : Math.min(h * sh.tanH, sh.R) - r;
+      const r2 = Math.max(0, x * x + y * y + z * z - h * h);
+      let m;
+      if (sh.ball) m = h < sh.R ? sh.R - Math.sqrt(r2 + (h - sh.R) * (h - sh.R)) : sh.R - Math.sqrt(r2);
+      else { const r = Math.sqrt(r2); m = h <= 0 ? -Math.max(r, -h) : Math.min(h * sh.tanH, sh.R) - r; }
       if (m > best) best = m;
     }
     return best;
   };
 
-  const reach = Math.max(4 * width, sh.R * Math.sqrt(1 + 1 / (sh.tanH * sh.tanH)) + width);
+  const reach = Math.max(4 * width, sh.ball ? 2 * sh.R : sh.R * Math.sqrt(1 + 1 / (sh.tanH * sh.tanH)) + width);
   const steps = [];
   for (let k = 1; k <= 16; k++) steps.push((4 * width * k) / 16);
   for (let k = 1; k <= 8; k++) steps.push(4 * width + ((reach - 4 * width) * k) / 8);
@@ -288,15 +444,18 @@ async function cutCheck(body, key, d, tool, width, zAxis, depths) {
   };
   const cutA = await faceCut(d.faces[0], d.intoA);
   const cutB = await faceCut(d.faces[1], d.intoB);
-  const hits = await nearFaceHits(body, d, idx, sh, D, zAxis, depths);
+  const hits = await nearFaceHits(body, d, idx, sh, off, zAxis);
 
   const count = { steep: 0, notch: 0, digs: 0 }, at = {};
   const mark = (why, i) => { count[why]++; if (!at[why]) at[why] = d.pts[i]; };
   let lo = Infinity, hi = 0, legLo = Infinity, legHi = 0, atHi = null, atLo = null;
   idx.forEach((i, j) => {
-    const tz = Math.abs(dot(d.tangents[i], zAxis));
-    if ((tz / Math.sqrt(Math.max(1e-12, 1 - tz * tz))) * sh.tanH >= STEEP) return mark("steep", i);
-    if (Math.min(dot(d.nA[i], zAxis), dot(d.nB[i], zAxis)) > NOTCH_SIN) return mark("notch", i);
+    // A ball cuts the same in every direction: no slope is too steep for it, and it can sit on a ridge.
+    if (!sh.ball) {
+      const tz = Math.abs(dot(d.tangents[i], zAxis));
+      if ((tz / Math.sqrt(Math.max(1e-12, 1 - tz * tz))) * sh.tanH >= STEEP) return mark("steep", i);
+      if (Math.min(dot(d.nA[i], zAxis), dot(d.nB[i], zAxis)) > NOTCH_SIN) return mark("notch", i);
+    }
     const a = cutA[j], b = cutB[j];
     if (!isFinite(a.leg) || !isFinite(b.leg)) return mark("digs", i);
     // The bevel's width, as the width of a square corner's chamfer with the same bevel face.
@@ -310,35 +469,68 @@ async function cutCheck(body, key, d, tool, width, zAxis, depths) {
   return {
     checked: idx.length, steep: count.steep, notch: count.notch, digs: count.digs, hits,
     width: measured ? [r3(lo), r3(hi)] : null, legs: measured ? [r3(legLo), r3(legHi)] : null,
-    at: { steep: pt(at.steep), notch: pt(at.notch), digs: pt(at.digs), hit: hits.length ? hits[0].at : null, widest: pt(atHi), narrowest: pt(atLo) },
+    at: { steep: pt(at.steep), notch: pt(at.notch), digs: pt(at.digs), hit: hits.length ? hits[0].at : null, shank: (hits.find((h) => h.part !== "cutter") || {}).at || null, widest: pt(atHi), narrowest: pt(atLo) },
   };
 }
 
-// Faces near the edge that end up inside the tool. Points up the tool's axis are dropped onto
-// each nearby face; a face point well inside the tool there is a hit. (The two faces of the
-// edge itself are let in as far as the chamfer goes.)
-async function nearFaceHits(body, d, idx, sh, D, zAxis, depths) {
-  const height = sh.coneHeight + 2 * sh.R;
-  const fr = [0.05, 0.12, 0.25, 0.45, 0.7, 1];
-  const stride = Math.max(1, Math.ceil(idx.length / HIT_SAMPLES));
-  const tips = idx.filter((_, j) => j % stride === 0 || j === idx.length - 1).map((i) => sub(d.pts[i], scale(zAxis, depths ? depths[i] : D)));
-  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
-  for (const t of tips) for (const p of [t, add(t, scale(zAxis, height))]) for (let k = 0; k < 3; k++) {
-    min[k] = Math.min(min[k], p[k] - sh.R - 0.5); max[k] = Math.max(max[k], p[k] + sh.R + 0.5);
+// Faces near the edge that end up inside the tool, anywhere up its length: the cutting end, the
+// shank or the holder. Points up the tool's axis are dropped onto each nearby face; a face point
+// inside the tool there is a hit. (At the cutting end the faces are let in as far as the edge
+// break goes; nothing may touch the shank or the holder.) Each hit: { face, part, at }.
+const UPPER_CLEAR = 0.02;   // mm a face may read inside the shank or holder before it counts
+async function nearFaceHits(body, d, idx, sh, off, zAxis) {
+  const heights = [0.05, 0.12, 0.25, 0.45, 0.7, 1].map((f) => f * sh.low);
+  for (let h = sh.low; ;) {
+    h += Math.max(1, Math.min(5, sh.at(h).r));
+    if (h >= sh.top) break;
+    heights.push(h);
   }
-  let names;
+  const stride = Math.max(1, Math.ceil(idx.length / HIT_SAMPLES));
+  const at = idx.filter((_, j) => j % stride === 0 || j === idx.length - 1);
+  const tips = at.map((i) => add(d.pts[i], off[i]));
+  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  for (const t of tips) for (const p of [t, add(t, scale(zAxis, sh.top))]) for (let k = 0; k < 3; k++) {
+    min[k] = Math.min(min[k], p[k] - sh.maxR - 0.5); max[k] = Math.max(max[k], p[k] + sh.maxR + 0.5);
+  }
+  let faces;
   try {
     const b = await run("inspect.body", { body, edges: false, maxFaces: 100000, faces: { box: { min, max } } });
-    names = (b.faces || []).map((f) => f.name);
-  } catch (_) { return []; }
-  const allowed = 1.5 * D * sh.tanH + 0.02, hits = [];
-  for (const face of names.slice(0, NEAR_FACES_MAX)) {
-    const query = [];
-    for (const t of tips) for (const f of fr) query.push(add(t, scale(zAxis, f * height)));
-    const r = await normalsOf(body, face, query);
+    faces = b.faces || [];
+  } catch (e) { if (engineGaveUp(e)) throw e; return []; }
+  // How far inside the tool the edge itself is: at the cutting end, faces are let in half as much again.
+  const allowed = 1.5 * Math.max(...at.map((i, k) => margin(d.pts[i], tips[k], zAxis, sh))) + 0.02, hits = [];
+  let asked = 0;
+  for (const face of faces) {
+    // Only the points of the tool that can reach this face: by its box, along the tool and sideways.
+    const bb = face.bbox && face.bbox.min && face.bbox.max ? face.bbox : null;
+    let lo = -Infinity, hi = Infinity;
+    if (bb) {
+      lo = Infinity; hi = -Infinity;
+      for (let c = 0; c < 8; c++) {
+        const s = dot([c & 1 ? bb.max[0] : bb.min[0], c & 2 ? bb.max[1] : bb.min[1], c & 4 ? bb.max[2] : bb.min[2]], zAxis);
+        lo = Math.min(lo, s); hi = Math.max(hi, s);
+      }
+    }
+    const query = [], owner = [];
+    tips.forEach((t, k) => {
+      for (const h of heights) {
+        const p = add(t, scale(zAxis, h));
+        if (bb) {
+          const s = dot(p, zAxis), r = Math.max(sh.R, sh.at(h).r) + 0.5;
+          if (s < lo - 5.5 || s > hi + 5.5) continue;
+          if (p.some((x, c) => x < bb.min[c] - r || x > bb.max[c] + r)) continue;
+        }
+        query.push(p); owner.push(k);
+      }
+    });
+    if (!query.length) continue;
+    if (++asked > NEAR_FACES_MAX) break;
+    const r = await normalsOf(body, face.name, query);
     for (let j = 0; j < query.length; j++) {
-      const q = r.points[j].point, tip = tips[Math.floor(j / fr.length)];
-      if (margin(q, tip, zAxis, sh) > allowed) { hits.push({ face, at: q.map((x) => Math.round(x * 100) / 100) }); break; }
+      const q = r.points[j].point, tip = tips[owner[j]];
+      const hq = dot(sub(q, tip), zAxis), part = hq < sh.cut ? "cutter" : sh.at(hq).part;
+      if (part === "none") continue;
+      if (margin(q, tip, zAxis, sh) > (part === "cutter" ? allowed : UPPER_CLEAR)) { hits.push({ face: face.name, part, at: q.map((x) => Math.round(x * 100) / 100) }); break; }
     }
   }
   return hits;
@@ -348,43 +540,74 @@ async function nearFaceHits(body, d, idx, sh, D, zAxis, depths) {
 function verdict(g, width, tolerance) {
   if (g.steep) return "steep";
   if (g.notch) return "notch";
+  if (g.hits.some((h) => h.part !== "cutter")) return "shank";
   if (g.hits.length) return "hit";
   if (g.digs || !g.width) return "digs";
   const off = Math.max(Math.abs(g.width[0] - width), Math.abs(g.width[1] - width)) / width;
   return off * 100 > tolerance ? "uneven" : null;
 }
 
-// ---------- even-width chamfer: how deep the tip must go ----------
-// What depth below the edge, at each point, gives a bevel exactly `width` wide (measured as in
-// cutCheck)? Worked out on each face's flat tangent plane with the edge taken as straight there,
-// so everything scales with the depth: find the bevel a depth of 1 gives, then scale. Counts
-// the tool at every position along the edge, as cutCheck does.
-function evenDepths(d, tool, width, zAxis) {
-  const { tanH } = toolShape(tool), t2 = tanH * tanH;
+// ---------- even-width break: where the tip must be ----------
+// Where must the tool tip be, at each point of the edge, for a break exactly `width` wide
+// (measured as in cutCheck)? Worked out on each face's flat tangent plane with the edge taken as
+// straight there, counting the tool at every position along the edge, as cutCheck does.
+//  Pointed tool: the tip goes below the edge, deep enough for the width. `flank` (mm) then moves
+//  it out from the part and down along the cone's side, so the side does the cutting and not
+//  the point, without changing the cut.
+//  Ball end mill: the ball's centre sits on the line that splits the corner evenly, close
+//  enough to the edge for the width.
+// Returns, per point, { offset (tip minus edge point), depth (how far the edge is inside the
+// tool's reach), legs (the cut on each face) }; offset null where no position works.
+function tipOffsets(d, tool, width, zAxis, flank = 0) {
+  const sh = toolShape(tool), t2 = sh.tanH * sh.tanH;
   const horiz = (v) => sub(v, scale(zAxis, dot(v, zAxis)));
-  return d.pts.map((p, i) => {
+  const none = { offset: null, depth: null, legs: null };
+  return d.pts.map((_, i) => {
     const t = d.tangents[i], tz = dot(t, zAxis), b = horiz(t);
-    const A2 = tz * tz * t2 - dot(b, b);
-    if (A2 >= -1e-9) return { depth: null, legs: null };     // too steep for this tool
-    // Is the point s along `dir` inside the tool at some position along the edge? (depth 1)
-    const inside = (dir, s) => {
-      const h0 = s * dot(dir, zAxis) + 1, a = scale(horiz(dir), s);
-      const tau = (tz * t2 * h0 - dot(a, b)) / A2, h = h0 - tau * tz;
-      if (h <= 0) return false;
-      const off = sub(a, scale(b, tau));
-      return h * h * t2 - dot(off, off) > 0;
-    };
-    const legOf = (dir) => {
-      if (inside(dir, 1000)) return Infinity;
+    const bis = unit(add(d.nA[i], d.nB[i]));
+    if (!bis) return none;
+    // inside(q, o): is the point q (from the edge point) inside the tool at some position along
+    // the edge, with the tip at o? offsetOf(depth): the tip for that depth.
+    let inside, offsetOf, maxDepth;
+    if (sh.ball) {
+      offsetOf = (dep) => sub(scale(bis, sh.R - dep), scale(zAxis, sh.R));
+      inside = (q, o) => {
+        const w = sub(q, add(o, scale(zAxis, sh.R))), along = dot(w, t);
+        return dot(w, w) - along * along < sh.R * sh.R;
+      };
+      maxDepth = 0.9 * sh.R;
+    } else {
+      const A2 = tz * tz * t2 - dot(b, b);
+      if (A2 >= -1e-9) return none;                            // too steep for this tool
+      let out = unit(cross(b, zAxis));
+      if (dot(out, bis) < 0) out = scale(out, -1);             // level, square to the edge, away from the part
+      offsetOf = (dep) => add(scale(zAxis, -dep - flank / sh.tanH), scale(out, flank));
+      inside = (q, o) => {
+        const v = sub(q, o), h0 = dot(v, zAxis), a = horiz(v);
+        const tau = (tz * t2 * h0 - dot(a, b)) / A2, h = h0 - tau * tz;
+        if (h <= 0) return false;
+        const side = sub(a, scale(b, tau));
+        return h * h * t2 - dot(side, side) > 0;
+      };
+      maxDepth = 0.9 * sh.coneHeight;
+    }
+    const legOf = (dir, o) => {
+      if (!inside([0, 0, 0], o)) return 0;
+      if (inside(scale(dir, 1000), o)) return Infinity;
       let lo = 0, hi = 1000;
-      for (let k = 0; k < 60; k++) { const mid = (lo + hi) / 2; if (inside(dir, mid)) lo = mid; else hi = mid; }
+      for (let k = 0; k < 60; k++) { const mid = (lo + hi) / 2; if (inside(scale(dir, mid), o)) lo = mid; else hi = mid; }
       return (lo + hi) / 2;
     };
-    const kA = legOf(d.intoA[i]), kB = legOf(d.intoB[i]);
-    if (!isFinite(kA) || !isFinite(kB)) return { depth: null, legs: null };
-    const unitWidth = len(sub(scale(d.intoA[i], kA), scale(d.intoB[i], kB))) / Math.SQRT2;
-    const depth = width / unitWidth;
-    return { depth, legs: [depth * kA, depth * kB] };
+    const cutAt = (dep) => {
+      const o = offsetOf(dep), kA = legOf(d.intoA[i], o), kB = legOf(d.intoB[i], o);
+      const w = isFinite(kA) && isFinite(kB) ? len(sub(scale(d.intoA[i], kA), scale(d.intoB[i], kB))) / Math.SQRT2 : Infinity;
+      return { w, legs: [kA, kB], o };
+    };
+    if (cutAt(maxDepth).w < width) return none;                // the width is too big for this tool here
+    let lo = 0, hi = maxDepth;
+    for (let k = 0; k < 50; k++) { const mid = (lo + hi) / 2; if (cutAt(mid).w < width) lo = mid; else hi = mid; }
+    const r = cutAt(hi);
+    return isFinite(r.w) ? { offset: r.o, depth: hi, legs: r.legs } : none;
   });
 }
 
@@ -412,7 +635,41 @@ function faceWidths(b) {
 const MODELED_MAX_WIDTH = 3;   // mm: faces narrower than this, meeting at a shallow angle, are modeled edge breaks
 const MODELED_MAX_ANGLE = 75;  // degrees
 
-let lastLeftOut = [];          // the edges the last search left out, for "Show left out"
+// The problem edges of the last Preview or Deburr, and what they were found on. They are kept
+// only while that still holds: same document, same setup, same part shape, and no new picks.
+// Anything else (a setting changed in the panel, Clear picks, a run that failed) forgets them.
+let lastRun = null;            // { edges: [{body, edge}], doc, setup, sigs: {body: shape signature} }
+const bodySig = (b) => JSON.stringify([b.massProps, b.faces, b.edges]);
+async function rememberProblems(edges, setup, sigs) {
+  lastRun = { edges: edges.map((x) => ({ body: x.body, edge: x.edge })), doc: await docKey(), setup, sigs };
+}
+// The last run's problem edges if they still apply, else [] (and they are forgotten). deep also
+// checks the part's shape, which asks PhysCAD for each body.
+async function problemEdges(deep) {
+  if (!lastRun) return [];
+  const run0 = lastRun;
+  let ok = false;
+  try {
+    ok = !(await pickedEdges()).length && (await docKey()) === run0.doc;
+    if (ok) { const s = await run("cam.setup.get", {}); ok = !!(s && s.setup && s.setup.id === run0.setup); }
+    if (ok && deep) {
+      for (const [body, sig] of Object.entries(run0.sigs)) {
+        if (bodySig(await run("inspect.body", { body, maxFaces: 100000 })) !== sig) { ok = false; break; }
+      }
+    }
+  } catch (_) { ok = false; }
+  if (lastRun !== run0) return lastRun ? lastRun.edges : [];   // a new run finished meanwhile
+  if (!ok) lastRun = null;
+  return ok ? run0.edges : [];
+}
+
+// Progress of a long command: PhysCAD's own bar (which has Cancel) and the bar in the panel.
+// ctx is what PhysCAD hands a command's run(): { progress(fraction, text), cancelled }.
+function progress(ctx, fraction, text) {
+  if (ctx && ctx.cancelled) throw new Error("Stopped. Nothing was changed.");
+  try { if (ctx && ctx.progress) ctx.progress(fraction, text); } catch (_) { /* progress is optional */ }
+  try { Promise.resolve(physcad.ui.sendToPanel("panel", { progress: { fraction, text } })).catch(() => {}); } catch (_) { /* panel closed */ }
+}
 
 // What the last search worked out for each edge, kept while the body and the setup's direction
 // stay the same, so a second search (or Create right after Find) doesn't ask PhysCAD again.
@@ -423,14 +680,42 @@ function cacheFor(body, b, zAxis) {
   return edgeCache[body];
 }
 
-async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = false, holeMin = 0, holeMax = 10, skipModeled = true, width = DEFAULT_WIDTH, tool, tolerance = DEFAULT_TOL, keepUneven = true } = {}) {
+// PhysCAD's Path operation cannot follow tool positions the plugin works out: that is asked
+// for (an optional `points` field on cam.op.trace). Everything else is built as if it could:
+// each 3D edge is checked on the even-width tool positions, and those are what the toolpath is
+// to follow. Until PATH_POINTS can be turned on, the toolpath made is a stand-in: the tip runs
+// `width` straight below each edge, which cuts an uneven break on wavy or sloped edges.
+const PATH_POINTS = false;
+const evenPaths = new Map();   // "body/edge" -> { d, offs }: the positions worked out, for the toolpath
+
+// One 3D edge, checked on its even-width tool positions. Returns { g, why }: cutCheck's answer
+// (null when no position works somewhere along the edge) and why it must be left out, or null.
+async function checkEven(cache, body, key, d, tool, width, tolerance, zAxis) {
+  const k = `${key} even ${isBall(tool) ? "ball" : tool.tipAngle || 90} ${tool.diameter || 6} ${width}`;
+  let v = cache.cut.get(k);
+  if (!v) {
+    const r = tipOffsets(d, tool, width, zAxis, 0);
+    if (r.every((x) => x.offset)) {
+      const offs = r.map((x) => x.offset);
+      v = { g: await cutCheck(body, key, d, tool, width, zAxis, offs), offs };
+    } else v = { g: null, offs: null, at: d.pts[r.findIndex((x) => !x.offset)].map((x) => Math.round(x * 100) / 100) };
+    cache.cut.set(k, v);
+  }
+  if (!v.g) return { g: null, why: isBall(tool) ? "size" : "steep", at: v.at };
+  evenPaths.set(edgeId(body, key), { d, offs: v.offs });
+  const why = verdict(v.g, width, tolerance);
+  return { g: v.g, why, at: why ? v.g.at[why === "uneven" ? "widest" : why] : null };
+}
+
+async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = false, holeMin = 0, holeMax = 10, skipModeled = true, width = DEFAULT_WIDTH, tool, tolerance = DEFAULT_TOL } = {}, ctx) {
   if (!(minAngle >= 0 && minAngle < 180)) throw new Error("The minimum angle must be between 0 and 180");
-  if (skipHoles && !(holeMax >= holeMin)) throw new Error("The largest hole size must be at least the smallest");
+  if (skipHoles && holeMax > 0 && !(holeMax >= holeMin)) throw new Error("The largest hole size must be at least the smallest");
   if (!(width > 0)) throw new Error("The chamfer width must be more than 0");
   if (!(tolerance > 0)) throw new Error("The tolerance must be more than 0");
   const started = Date.now();
   callStats = {};
   engineRestarts = 0;
+  lastRun = null;
   const info = await openSetup();
   const zAxis = unit(info.geometry.axes.z);
   const bodies = info.setup.bodies || [info.setup.body];
@@ -439,21 +724,27 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
   let t = null, checkTool = null, check = "on";
   try { t = await pickTool(tool, info); checkPointed(t, width); checkTool = t; }
   catch (e) { check = "off: " + e.message; }
-  const found = [], skipped = {}, flagged = [], partial = [];
-  let reused = 0, uneven = 0;
+  const found = [], skipped = {}, flagged = [], partial = [], sigs = {};
+  let reused = 0;
   const skip = (why) => { skipped[why] = (skipped[why] || 0) + 1; };
-  for (const body of bodies) {
+  progress(ctx, 0, "Reading the part");
+  for (const [bodyNo, body] of bodies.entries()) {
     const b = await run("inspect.body", { body, maxFaces: 100000 });
+    sigs[body] = bodySig(b);
+    const total = (b.edges || []).length;
+    let edgeNo = 0;
     const facesByName = {};
     for (const f of b.faces || []) facesByName[f.name] = f;
     const widths = faceWidths(b);
     const cache = cacheFor(body, b, zAxis);
     for (const e of b.edges || []) {
+      progress(ctx, (bodyNo + edgeNo / Math.max(1, total)) / bodies.length, `Checking edge ${edgeNo + 1} of ${total}`);
+      edgeNo++;
       if (excluded.has(e.key) || excluded.has(edgeId(body, e.key))) { skip("excluded by you"); continue; }
       const faces = (e.faces || []).map((n) => facesByName[n]).filter(Boolean);
       if (skipHoles) {
         const hole = faces.find((f) => f.surface === "cylinder" && f.internal);
-        if (hole && 2 * hole.radius >= holeMin && 2 * hole.radius <= holeMax) { skip("hole in the skipped size range"); continue; }
+        if (hole && 2 * hole.radius >= holeMin && (!(holeMax > 0) || 2 * hole.radius <= holeMax)) { skip("hole in the skipped size range"); continue; }
       }
       const cKey = `${e.key} ${minAngle}`;
       let c = cache.classify.get(cKey);
@@ -466,25 +757,20 @@ async function findEdges({ minAngle = DEFAULT_MIN_ANGLE, exclude, skipHoles = fa
       if (skipModeled && c.angle < MODELED_MAX_ANGLE && faces.some((f) => widths[f.name] < MODELED_MAX_WIDTH)) { skip("already chamfered or rounded on the model"); continue; }
       const item = { body, edge: e.key, kind: c.kind, angle: Math.round(c.angle), length: Math.round(e.length * 100) / 100 };
       if (c.kind === "3d" && checkTool) {
-        const gKey = `${e.key} ${minAngle} ${checkTool.tipAngle || 90} ${checkTool.diameter || 6} ${width}`;
-        let g = cache.cut.get(gKey);
-        if (!g) { g = await cutCheck(body, e.key, c.data, checkTool, width, zAxis); cache.cut.set(gKey, g); }
-        const why = verdict(g, width, tolerance);
-        item.cutWidth = g.width;
-        // Uneven only: the tool cuts it safely, but the break's width varies. Kept unless told not to.
-        if (why === "uneven" && keepUneven) { item.uneven = true; uneven++; }
-        else if (why) {
-          skip(REASONS[why]);
-          flagged.push({ body, edge: e.key, why, reason: REASONS[why], cutWidth: g.width, at: g.at[why === "uneven" ? "widest" : why] });
+        const v = await checkEven(cache, body, e.key, c.data, checkTool, width, tolerance, zAxis);
+        item.cutWidth = v.g && v.g.width;
+        if (v.why) {
+          skip(REASONS[v.why]);
+          flagged.push({ body, edge: e.key, why: v.why, reason: REASONS[v.why], cutWidth: item.cutWidth, at: v.at });
           continue;
         }
       }
       found.push(item);
     }
   }
-  lastLeftOut = [...flagged, ...partial].map((x) => ({ body: x.body, edge: x.edge }));
+  await rememberProblems([...flagged, ...partial], info.setup.id, sigs);
   const doc = await docInfo();
-  return { setup: info.setup.id, units: doc.units || "mm", width, tool: t ? toolLabel(t) : null, check, edges: found, uneven, skipped, flagged, partial, timing: { ms: Date.now() - started, reused, engineRestarts, commands: callStats } };
+  return { setup: info.setup.id, units: doc.units || "mm", width, tool: t ? toolLabel(t) : null, check, standIn: !PATH_POINTS, edges: found, skipped, flagged, partial, timing: { ms: Date.now() - started, reused, engineRestarts, commands: callStats } };
 }
 
 // Pick a tool: the number or id given, else a chamfer mill / spot drill from the library.
@@ -530,20 +816,32 @@ async function selectedEdges() {
   return items.filter((i) => i && i.type === "edge" && i.body && i.edge).map((i) => ({ body: i.body, edge: i.edge }));
 }
 
+// Edges end up selected in the view that the person did not pick to deburr: the ones Preview or
+// Show left out highlights, and the ones a toolpath was just made on. Those must not count as
+// picks, or Deburr picked edges would make a second toolpath on them. quietKey is that
+// selection; it stops applying as soon as the person changes what is selected.
+let quietKey = null;
+async function quietSelection() {
+  try { quietKey = sameKey(await selectedEdges()); } catch (_) { quietKey = null; }
+}
+async function pickedEdges() {
+  const s = await selectedEdges();
+  return s.length && sameKey(s) === quietKey ? [] : s;
+}
+
 // ---------- commands ----------
 const FIND_PARAMS = {
   minAngle: { type: "number", description: "Degrees between the two faces' directions below which an edge counts as smooth (default 30)" },
   exclude: { type: "array", items: { type: "string" }, description: "Edge keys to leave out (default: the ones excluded in the panel for this document)" },
   skipHoles: { type: "boolean", description: "Leave out round holes whose diameter is between holeMin and holeMax" },
   holeMin: { type: "number", description: "mm, default 0" },
-  holeMax: { type: "number", description: "mm, default 10" },
+  holeMax: { type: "number", description: "mm, default 10; 0: no upper limit" },
   skipModeled: { type: "boolean", description: "Leave out edges already chamfered or rounded on the model (default true)" },
   width: { type: "number", description: "Chamfer width mm (default 0.25)" },
   tool: { type: ["number", "string"], description: "Library tool number or id (default: a chamfer mill or spot drill, one the setup already uses if it can)" },
-  tolerance: { type: "number", description: "Percent the cut width on a wavy or sloped (3D) edge may differ from width before the edge counts as uneven (default 20)" },
-  keepUneven: { type: "boolean", description: "Keep 3D edges whose only fault is an uneven cut width (default true; they are marked uneven: true). false leaves them out, listed in flagged." },
+  tolerance: { type: "number", description: "Percent the cut width on a wavy or sloped (3D) edge may differ from width before the edge is left out (default 20)" },
 };
-const findArgs = (a) => ({ minAngle: a.minAngle, exclude: a.exclude, skipHoles: a.skipHoles, holeMin: a.holeMin, holeMax: a.holeMax, skipModeled: a.skipModeled, width: a.width, tool: a.tool, tolerance: a.tolerance, keepUneven: a.keepUneven });
+const findArgs = (a) => ({ minAngle: a.minAngle, exclude: a.exclude, skipHoles: a.skipHoles, holeMin: a.holeMin, holeMax: a.holeMax, skipModeled: a.skipModeled, width: a.width, tool: a.tool, tolerance: a.tolerance });
 
 function checkPasses(passes) {
   if (!(Number.isInteger(passes) && passes >= 1 && passes <= 10)) throw new Error("Passes must be a whole number from 1 to 10");
@@ -552,14 +850,15 @@ function checkPasses(passes) {
 physcad.commands.register({
   id: "findEdges",
   title: "Find deburr edges",
-  description: "List (and highlight) the sharp outside edges of the open setup's part that a tool can reach from above. kind level: a flat top over a vertical wall at one height (2D Chamfer). kind 3d: anything else (Path); these are checked with the tool and width given, and left out (listed in flagged, with why and where) when the edge climbs too steeply for the tool, the tool would cut a groove, hit a nearby face or dig into a face beside the edge, or the cut width would vary more than tolerance. An edge whose only fault is an uneven cut width is kept and marked uneven: true, unless keepUneven is false. cutWidth: the narrowest and widest bevel along the edge, mm. partial: edges skipped because only part of them qualifies.",
+  description: "List (and highlight) the sharp outside edges of the open setup's part that a tool can reach from above. kind level: a flat top over a vertical wall at one height (2D Chamfer). kind 3d: anything else (Path); these are checked on the even-width tool positions with the tool and width given, and left out (listed in flagged, with why and where) when the edge climbs too steeply for the tool, the tool would cut a groove, hit a nearby face with its cutting end, shank or holder, or dig into a face beside the edge, or the cut width would still vary more than tolerance. cutWidth: the narrowest and widest break those positions cut, mm. standIn true: PhysCAD cannot follow those positions yet, so the toolpath made runs at one depth and cuts an uneven break on 3D edges. partial: edges skipped because only part of them qualifies.",
   params: { type: "object", properties: { ...FIND_PARAMS, highlight: { type: "boolean" } }, additionalProperties: false },
-  async run(a = {}) {
-    const r = await findEdges(findArgs(a));
+  async run(a = {}, ctx) {
+    const r = await findEdges(findArgs(a), ctx);
     r.inCam = await inCam();
     // Outside CAM, selecting edges pops up PhysCAD's Edge card, so only highlight in CAM.
     if (a.highlight !== false && r.inCam) {
       try { await run("selection.set", { items: r.edges.map((e) => ({ type: "edge", body: e.body, edge: e.edge })) }); } catch (_) { /* highlighting is optional */ }
+      await quietSelection();
     }
     return r;
   },
@@ -568,11 +867,27 @@ physcad.commands.register({
 physcad.commands.register({
   id: "showLeftOut",
   title: "Show left-out edges",
-  description: "Highlight the edges the last search left out because the tool can't cut them cleanly or only part of them qualifies.",
+  description: "Highlight the edges the last Preview or Deburr had a problem with (the tool can't cut them cleanly, or only part of them qualifies). Nothing when the part, setup, document or picks have changed since.",
   async run() {
-    if (lastLeftOut.length && (await inCam())) await run("selection.set", { items: lastLeftOut.map((e) => ({ type: "edge", ...e })) });
-    return { count: lastLeftOut.length };
+    const edges = await problemEdges(true);
+    if (edges.length && (await inCam())) { await run("selection.set", { items: edges.map((e) => ({ type: "edge", ...e })) }); await quietSelection(); }
+    return { count: edges.length };
   },
+});
+
+physcad.commands.register({
+  id: "problemCount",
+  title: "Count problem edges",
+  description: "How many problem edges the last Preview or Deburr found, if that result still applies (same document, setup and picks; deep: true also checks the part's shape). 0 otherwise.",
+  params: { type: "object", properties: { deep: { type: "boolean" } } },
+  async run({ deep } = {}) { return { count: (await problemEdges(!!deep)).length }; },
+});
+
+physcad.commands.register({
+  id: "forgetProblems",
+  title: "Forget problem edges",
+  description: "Forget the last run's problem edges (a setting changed, so they may no longer be right).",
+  async run() { lastRun = null; return { count: 0 }; },
 });
 
 // A Path toolpath with a pointed tool's tip run along each edge, `width` below it. On a flat
@@ -584,146 +899,208 @@ function checkPointed(t, width) {
   const reach = (t.diameter / 2) / Math.tan(((t.tipAngle || 90) / 2) * Math.PI / 180);
   if (width >= reach) throw new Error(`The width is too big for tool ${t.number}'s cone`);
 }
-async function makePathOp(setupId, edges, t, width, passes) {
+// The tool positions for one edge, in the shape asked of PhysCAD: { closed, tip: [[x,y,z], ...] }.
+function chainOf(d, offs, zAxis) {
+  const offAt = offsetAlong(d, offs, zAxis);
+  return { closed: d.closed, tip: d.dense.map((e) => add(e.p, offAt(e.arc, e.t, e.side)).map(r4)) };
+}
+async function makePathOp(setupId, edges, t, width, passes, zAxis) {
   const name = await nextName(setupId, "Deburr 3D");
-  const fields = { name, tool: t.id || t.number, geometry: { edges: edges.map((e) => ({ body: e.body, edge: e.edge })) }, heights: { bottomOffset: -width } };
+  const fields = { name, tool: t.id || t.number };
+  const paths = edges.map((e) => evenPaths.get(edgeId(e.body, e.edge)));
+  if (PATH_POINTS && paths.every(Boolean)) fields.points = paths.map((x) => chainOf(x.d, x.offs, zAxis));
+  else { fields.geometry = { edges: edges.map((e) => ({ body: e.body, edge: e.edge })) }; fields.heights = { bottomOffset: -width }; }
   if (passes > 1) fields.stepdown = width / passes;
   const op = await run("cam.op.trace", { fields });
   return { op, name, edgeCount: edges.length };
 }
 
+// Make the deburr toolpaths: on the edges picked in the view when there are any (or `edges`),
+// else on every edge findEdges finds. Level edges get one 2D Chamfer operation, the rest one
+// Path operation. Picked edges are all cut, whatever their check says: picking an edge is the
+// person saying "this one". The ones with a problem are listed in flagged.
+async function deburr(a, ctx, mustPick) {
+  const { width = DEFAULT_WIDTH, tolerance = DEFAULT_TOL, passes = 1, tool, wallClear = 0 } = a;
+  if (!(width > 0)) throw new Error("The chamfer width must be more than 0");
+  if (!(tolerance > 0)) throw new Error("The tolerance must be more than 0");
+  if (!(wallClear >= 0)) throw new Error("The wall clearance can't be negative");
+  checkPasses(passes);
+  lastRun = null;
+  const info = await openSetup();
+  const zAxis = unit(info.geometry.axes.z);
+  const picks = a.edges && a.edges.length ? a.edges : await pickedEdges();
+  if (mustPick && !picks.length) throw new Error("Pick one or more edges on the part first");
+  let edges, flagged, skipped = {}, partial = [];
+  if (picks.length) {
+    const t0 = await pickTool(tool, info);
+    edges = []; flagged = [];
+    const bodies = {}, sigs = {};
+    for (const [pickNo, p] of picks.entries()) {
+      progress(ctx, pickNo / picks.length, `Checking edge ${pickNo + 1} of ${picks.length}`);
+      if (!bodies[p.body]) {
+        const b = await run("inspect.body", { body: p.body, maxFaces: 100000 });
+        sigs[p.body] = bodySig(b);
+        bodies[p.body] = { cache: cacheFor(p.body, b, zAxis), edges: {} };
+        for (const e of b.edges || []) bodies[p.body].edges[e.key] = e;
+      }
+      const { cache, edges: byKey } = bodies[p.body], e = byKey[p.edge];
+      if (!e) { flagged.push({ ...p, why: "unknown", reason: "not found on the part (not cut)" }); continue; }
+      let c = cache.classify.get(`${e.key} 0`);
+      if (!c) { c = await classifyEdge(p.body, e, zAxis, 0); cache.classify.set(`${e.key} 0`, c); }
+      const item = { ...p, kind: c.ok ? c.kind : "3d" };
+      if (!c.ok) flagged.push({ ...p, why: "shape", reason: c.reason });
+      else if (c.kind === "3d" && isPointed(t0)) {
+        const v = await checkEven(cache, p.body, e.key, c.data, t0, width, tolerance, zAxis);
+        item.cutWidth = v.g && v.g.width;
+        if (v.why) flagged.push({ ...p, why: v.why, reason: REASONS[v.why], cutWidth: item.cutWidth, at: v.at });
+      }
+      edges.push(item);
+    }
+    if (!edges.length) throw new Error("None of the picked edges are on the part.");
+  } else {
+    const r = await findEdges(findArgs(a), ctx);
+    ({ edges, flagged, skipped, partial } = r);
+    if (!edges.length) {
+      const why = flagged.length ? ` ${flagged.length} were left out: ${[...new Set(flagged.map((f) => f.reason))].join("; ")}.` : "";
+      throw new Error("No edges this tool can deburr cleanly." + why);
+    }
+  }
+  progress(ctx, 1, "Making the toolpath");
+  const level = edges.filter((e) => e.kind === "level"), wavy = edges.filter((e) => e.kind !== "level");
+  const t = await pickTool(tool, info);
+  if (wavy.length) checkPointed(t, width);
+  const ops = [];
+  // Remember each toolpath the moment it exists, so Remove last deburr can take it away even if
+  // a later step fails.
+  lastMade = { setup: info.setup.id, ops: [] };
+  const made = (o) => { ops.push(o); lastMade.ops.push({ id: opIdOf(o.op), name: o.name }); };
+  if (level.length) {
+    const name = await nextName(info.setup.id);
+    const op = await run("cam.op.chamfer", {
+      fields: { name, tool: t.id || t.number, geometry: { edges: level.map((e) => ({ body: e.body, edge: e.edge })) }, chamferWidth: width, chamferPasses: passes, ...(wallClear > 0 ? { chamferWallClear: wallClear } : {}) },
+    });
+    made({ op, name, edgeCount: level.length });
+  }
+  if (wavy.length) made(await makePathOp(info.setup.id, wavy, t, width, passes, zAxis));
+  // The toolpaths exist now. Nothing after this may turn the run into an error.
+  const standIn = !PATH_POINTS && wavy.length > 0;
+  try {
+    await quietSelection();
+    // Picked edges: remembered only now, with the picks turned into a highlight, so they count.
+    if (picks.length) await rememberProblems(flagged, info.setup.id, sigs);
+    const names = ops.map((o) => `${o.name} (${o.edgeCount} edges)`).join(" and ");
+    const left = !flagged.length ? "" : picks.length ? ` ${flagged.length} picked edges have a problem.` : ` ${flagged.length} edges left out.`;
+    const rough = standIn ? " Wavy edges are cut at one depth for now, so their break is uneven." : "";
+    await physcad.ui.toast(`Made ${names} with ${toolLabel(t)}.${rough}${left} Check it in simulation before cutting.`, flagged.length || standIn ? "info" : "success");
+  } catch (_) { /* the message is optional; the toolpaths are made */ }
+  const doc = await docInfo();
+  return { ops, mode: picks.length ? "picked" : "all", standIn, edgeCount: edges.length, edges, units: doc.units || "mm", width, tool: toolLabel(t), skipped, flagged, partial };
+}
+const PICK_PARAM = { type: "array", items: { type: "object", properties: { body: { type: "string" }, edge: { type: "string" } }, required: ["body", "edge"] }, description: "Deburr these edges, [{body, edge}], in place of the ones picked in the view" };
+const MAKE_PARAMS = { passes: { type: "integer" }, wallClear: { type: "number", description: "Level edges' chamfer op: how close the tool's side may come to a wall it isn't chamfering, mm (default 0: touching it)" }, edges: PICK_PARAM };
+
 physcad.commands.register({
   id: "createDeburr",
   title: "Create deburr toolpath",
-  description: "Deburr every edge findEdges finds: one 2D Chamfer operation for the level edges and one Path operation for the wavy or sloped (3D) edges that pass its check. width: chamfer width mm (default 0.25). passes: 1-10 (default 1). tool: library tool number or id.",
-  params: {
-    type: "object",
-    properties: { ...FIND_PARAMS, passes: { type: "integer" }, wallClear: { type: "number", description: "Level edges' chamfer op: how close the tool's side may come to a wall it isn't chamfering, mm (default 0: touching it)" } },
-    additionalProperties: false,
-  },
-  async run(a = {}) {
-    const { width = DEFAULT_WIDTH, passes = 1, tool, wallClear = 0 } = a;
-    if (!(wallClear >= 0)) throw new Error("The wall clearance can't be negative");
-    checkPasses(passes);
-    const r = await findEdges(findArgs(a));
-    if (!r.edges.length) {
-      const why = r.flagged.length ? ` ${r.flagged.length} were left out: ${[...new Set(r.flagged.map((f) => f.reason))].join("; ")}.` : "";
-      throw new Error("No edges this tool can deburr cleanly." + why);
-    }
-    const level = r.edges.filter((e) => e.kind === "level"), wavy = r.edges.filter((e) => e.kind === "3d");
-    const t = await pickTool(tool, await openSetup());
-    if (wavy.length) checkPointed(t, width);
-    const ops = [];
-    if (level.length) {
-      const name = await nextName(r.setup);
-      const op = await run("cam.op.chamfer", {
-        fields: { name, tool: t.id || t.number, geometry: { edges: level.map((e) => ({ body: e.body, edge: e.edge })) }, chamferWidth: width, chamferPasses: passes, ...(wallClear > 0 ? { chamferWallClear: wallClear } : {}) },
-      });
-      ops.push({ op, name, edgeCount: level.length });
-    }
-    if (wavy.length) ops.push(await makePathOp(r.setup, wavy, t, width, passes));
-    const names = ops.map((o) => `${o.name} (${o.edgeCount} edges)`).join(" and ");
-    const left = r.flagged.length ? ` ${r.flagged.length} edges left out.` : "";
-    const rough = r.uneven ? ` ${r.uneven} edges will have an uneven break.` : "";
-    await physcad.ui.toast(`Made ${names} with ${toolLabel(t)}.${rough}${left} Check it in simulation before cutting.`, r.flagged.length || r.uneven ? "info" : "success");
-    return { ops, edgeCount: r.edges.length, uneven: r.uneven, edges: r.edges, units: r.units, width, tool: toolLabel(t), skipped: r.skipped, flagged: r.flagged, partial: r.partial };
-  },
+  description: "Make the deburr toolpaths: on the edges picked in the view when there are any (every picked edge is cut, and the ones with a problem are listed in flagged), else on every edge findEdges finds. One 2D Chamfer operation for the level edges and one Path operation for the wavy or sloped (3D) ones. standIn true: the Path operation runs at one depth for now and cuts an uneven break (see findEdges). width: chamfer width mm (default 0.25). passes: 1-10 (default 1). tool: library tool number or id.",
+  params: { type: "object", properties: { ...FIND_PARAMS, ...MAKE_PARAMS }, additionalProperties: false },
+  async run(a = {}, ctx) { return deburr(a, ctx, false); },
 });
 
-// Edges the person picks, any shape: one Path operation. Every picked edge is cut; the checks
-// only say which of them have a problem (keepFlagged: false leaves those out).
 physcad.commands.register({
   id: "deburrSelected",
-  title: "Deburr selected edges",
-  description: "Add a Path operation that chamfers the edges picked in the view (any shape, wavy in 3D too) with a pointed tool, its tip `width` mm below each edge. Every picked edge is cut. Each gets the same check as findEdges' 3D edges, and the ones that fail (uneven width, the tool gouging or hitting the part, an inside corner, an edge facing down) are listed in flagged with why; keepFlagged: false leaves those out. width default 0.25; tolerance percent (default 20); passes 1-10 (default 1); tool: library tool number or id. edges: [{body, edge}] instead of the picks.",
-  params: {
-    type: "object",
-    properties: {
-      width: { type: "number" },
-      tolerance: { type: "number" },
-      passes: { type: "integer" },
-      tool: { type: ["number", "string"] },
-      edges: { type: "array", items: { type: "object", properties: { body: { type: "string" }, edge: { type: "string" } }, required: ["body", "edge"] } },
-      keepFlagged: { type: "boolean", description: "Cut the edges that fail the check too (default true)" },
-    },
-    additionalProperties: false,
-  },
-  async run({ width = DEFAULT_WIDTH, tolerance = DEFAULT_TOL, passes = 1, tool, edges, keepFlagged = true } = {}) {
-    if (!(width > 0)) throw new Error("The chamfer width must be more than 0");
-    if (!(tolerance > 0)) throw new Error("The tolerance must be more than 0");
-    checkPasses(passes);
-    const info = await openSetup();
-    const picks = edges && edges.length ? edges : await selectedEdges();
-    if (!picks.length) throw new Error("Pick one or more edges on the part first");
-    const t = await pickTool(tool, info);
-    checkPointed(t, width);
-    const zAxis = unit(info.geometry.axes.z);
-    const keep = [], flagged = [];
-    const edgesOf = {};
-    for (const p of picks) {
-      if (!edgesOf[p.body]) {
-        const b = await run("inspect.body", { body: p.body, maxFaces: 100000 });
-        edgesOf[p.body] = {};
-        for (const e of b.edges || []) edgesOf[p.body][e.key] = e;
-      }
-      const e = edgesOf[p.body][p.edge];
-      const flag = (why, reason, extra) => { flagged.push({ ...p, why, reason, ...extra }); if (keepFlagged) keep.push(p); };
-      if (!e) { flagged.push({ ...p, why: "unknown", reason: "not found on the part" }); continue; }
-      const c = await classifyEdge(p.body, e, zAxis, 0);
-      if (!c.ok) { flag("shape", c.reason); continue; }
-      const g = await cutCheck(p.body, p.edge, c.data, t, width, zAxis);
-      const why = verdict(g, width, tolerance);
-      if (why) { flag(why, REASONS[why], { cutWidth: g.width, at: g.at[why === "uneven" ? "widest" : why] }); continue; }
-      keep.push({ ...p, cutWidth: g.width });
-    }
-    lastLeftOut = flagged.map((x) => ({ body: x.body, edge: x.edge }));
-    const doc = await docInfo();
-    if (!keep.length) {
-      throw new Error(`None of the ${picks.length} picked edges can be cut cleanly with ${toolLabel(t)}: ${[...new Set(flagged.map((f) => f.reason))].join("; ")}.`);
-    }
-    const r = await makePathOp(info.setup.id, keep, t, width, passes);
-    const left = !flagged.length ? "" : keepFlagged ? ` ${flagged.length} of them have a problem.` : ` Left out ${flagged.length}.`;
-    await physcad.ui.toast(`${r.name}: ${keep.length} edges with ${toolLabel(t)}.${left} Check it in simulation before cutting.`, flagged.length ? "info" : "success");
-    return { ...r, units: doc.units || "mm", tool: toolLabel(t), edges: keep, flagged, keptFlagged: keepFlagged };
-  },
+  title: "Deburr picked edges",
+  description: "createDeburr on the edges picked in the view (or `edges`) only: an error when none are picked.",
+  params: { type: "object", properties: { width: FIND_PARAMS.width, tolerance: FIND_PARAMS.tolerance, tool: FIND_PARAMS.tool, ...MAKE_PARAMS }, additionalProperties: false },
+  async run(a = {}, ctx) { return deburr(a, ctx, true); },
 });
 
-// Developer check: the depth at each point along an edge for an even bevel (not in the panel).
+// Developer checks (not in the panel): where the tip must be along an edge for an even break.
+function checkTipTool(t, width) {
+  if (!isBall(t)) return checkPointed(t, width);
+  if (width >= t.diameter / 2) throw new Error(`The width is too big for tool ${t.number}'s ball`);
+}
+async function solveEdge({ body, edge, width = DEFAULT_WIDTH, tool, flank = 0 }) {
+  if (!(width > 0)) throw new Error("The width must be more than 0");
+  if (!(flank >= 0)) throw new Error("The flank shift can't be negative");
+  const info = await openSetup();
+  const zAxis = unit(info.geometry.axes.z);
+  const t = await pickTool(tool, info);
+  checkTipTool(t, width);
+  const b = await run("inspect.body", { body, maxFaces: 100000 });
+  const e = (b.edges || []).find((x) => x.key === edge);
+  if (!e) throw new Error(`No edge ${edge} on ${body}`);
+  const d = await sampleEdge(body, edge, e.faces, e.length);
+  if (!d) throw new Error("Could not sample the edge");
+  await addInto(d, "A");
+  await addInto(d, "B");
+  const r = tipOffsets(d, t, width, zAxis, isBall(t) ? 0 : flank);
+  return { t, d, r, zAxis, solved: r.every((x) => x.offset) };
+}
+const TIP_PARAMS = {
+  body: { type: "string" }, edge: { type: "string" }, width: { type: "number" },
+  tool: { type: ["number", "string"], description: "Library tool number or id: a pointed chamfer mill or spot drill, or a ball end mill" },
+  flank: { type: "number", description: "Pointed tools: mm to move the tip out from the part and down along the cone's side, so the side cuts and not the point (default 0)" },
+};
+
 physcad.commands.register({
   id: "evenDepth",
   title: "Even-width depths",
-  description: "For one edge: how deep below the edge the tool tip must go at each point for a bevel exactly `width` wide, and the cut on each face that gives. tooSteep: points where no depth works with this tool.",
-  params: { type: "object", properties: { body: { type: "string" }, edge: { type: "string" }, width: { type: "number" }, tool: { type: ["number", "string"] }, points: { type: "boolean", description: "Also return the tip positions (world mm) and the bevel width those positions would cut" } }, required: ["body", "edge"] },
-  async run({ body, edge, width = DEFAULT_WIDTH, tool, points = false } = {}) {
-    const info = await openSetup();
-    const zAxis = unit(info.geometry.axes.z);
-    const t = await pickTool(tool, info);
-    checkPointed(t, width);
-    const b = await run("inspect.body", { body, maxFaces: 100000 });
-    const e = (b.edges || []).find((x) => x.key === edge);
-    if (!e) throw new Error(`No edge ${edge} on ${body}`);
-    const d = await sampleEdge(body, edge, e.faces, e.length);
-    if (!d) throw new Error("Could not sample the edge");
-    await addInto(d, "A");
-    await addInto(d, "B");
-    const r = evenDepths(d, t, width, zAxis);
-    const ok = r.filter((x) => x.depth !== null);
-    const r3 = (x) => Math.round(x * 1000) / 1000;
+  description: "For one edge: where the tool tip must be at each point for a break exactly `width` wide, and the cut on each face that gives. depth: how far the edge is inside the tool. tooSteep: points where no position works with this tool.",
+  params: { type: "object", properties: { ...TIP_PARAMS, points: { type: "boolean", description: "Also return the tip positions (world mm) and the break those positions would cut" } }, required: ["body", "edge"] },
+  async run(a = {}) {
+    const { t, d, r, zAxis, solved } = await solveEdge(a);
+    const ok = r.filter((x) => x.offset);
     const range = (xs) => (xs.length ? [r3(Math.min(...xs)), r3(Math.max(...xs))] : null);
     const out = {
       tool: toolLabel(t), points: r.length, tooSteep: r.length - ok.length,
       depth: range(ok.map((x) => x.depth)),
       cutOnFaceA: range(ok.map((x) => x.legs[0])), cutOnFaceB: range(ok.map((x) => x.legs[1])),
     };
-    if (points && ok.length === r.length) {
-      const depths = r.map((x) => x.depth);
-      const g = await cutCheck(body, edge, d, t, width, zAxis, depths);
+    if (a.points && solved) {
+      const offs = r.map((x) => x.offset);
+      const g = await cutCheck(a.body, a.edge, d, t, a.width || DEFAULT_WIDTH, zAxis, offs);
       out.closed = d.closed;
       out.wouldCut = { width: g.width, legs: g.legs, steep: g.steep, notch: g.notch, digs: g.digs, hits: g.hits.length };
-      out.tips = d.pts.map((p, i) => sub(p, scale(zAxis, depths[i])).map((x) => Math.round(x * 10000) / 10000));
+      out.tips = d.pts.map((p, i) => add(p, offs[i]).map(r4));
     }
     return out;
   },
+});
+
+// The tool path for an even break on one edge, in the shape asked of PhysCAD for cam.op.trace's
+// `points`: chains of tool tip positions in world mm. Nothing can follow it yet.
+const PATH_STEP = 0.25;       // mm between the tip positions given
+physcad.commands.register({
+  id: "tipPath",
+  title: "Even-width tool path",
+  description: "For one edge: the tool tip positions (world mm, `step` mm apart) that would cut a break exactly `width` wide, with a pointed tool or a ball end mill, and the check of what they would cut (wouldCut: width range, and steep, notch, digs and hit counts). chains: [{closed, tip: [[x,y,z], ...]}]. No toolpath is made: PhysCAD's Path operation cannot follow these yet.",
+  params: { type: "object", properties: { ...TIP_PARAMS, step: { type: "number", description: "mm between the positions given (default 0.25)" }, tips: { type: "boolean", description: "false: leave the positions out, give only the check (default true)" } }, required: ["body", "edge"] },
+  async run(a = {}) {
+    const step = a.step || PATH_STEP;
+    if (!(step > 0)) throw new Error("The step must be more than 0");
+    const width = a.width || DEFAULT_WIDTH;
+    const { t, d, r, zAxis, solved } = await solveEdge(a);
+    const out = { tool: toolLabel(t), ball: isBall(t), width, flank: isBall(t) ? 0 : a.flank || 0, solved, unsolved: r.filter((x) => !x.offset).length };
+    if (!solved) return out;
+    const offs = r.map((x) => x.offset);
+    const g = await cutCheck(a.body, a.edge, d, t, width, zAxis, offs);
+    out.wouldCut = { width: g.width, legs: g.legs, steep: g.steep, notch: g.notch, digs: g.digs, hits: g.hits.length, widestAt: g.at.widest, narrowestAt: g.at.narrowest };
+    // One position at each of d.dense (thinned to `step`), keeping both positions at a sharp corner.
+    const every = Math.max(1, Math.round(step / FETCH_STEP)), offAt = offsetAlong(d, offs, zAxis);
+    const tip = d.dense.filter((e, i) => i % every === 0 || e.side !== 0 || i === d.dense.length - 1)
+      .map((e) => add(e.p, offAt(e.arc, e.t, e.side)).map(r4));
+    out.corners = d.corners.map(r3);
+    out.chains = [{ closed: d.closed, points: tip.length, ...(a.tips === false ? {} : { tip }) }];
+    return out;
+  },
+});
+
+physcad.commands.register({
+  id: "selectedCount",
+  title: "Count picked edges",
+  description: "How many edges the person has picked in the view to deburr. Edges the plugin highlighted, or just made a toolpath on, do not count.",
+  async run() { return { count: (await pickedEdges()).length }; },
 });
 
 physcad.commands.register({
@@ -744,7 +1121,7 @@ physcad.commands.register({
   id: "clearExcluded",
   title: "Clear excluded edges",
   description: "Empty this document's list of excluded edges.",
-  async run() { await setExcluded([]); return { excluded: 0 }; },
+  async run() { await setExcluded([]); lastRun = null; return { excluded: 0 }; },
 });
 
 physcad.commands.register({
@@ -793,12 +1170,51 @@ physcad.commands.register({
   description: "Turn pick mode on or off. While on, each click on an edge adds it to the selection and clicking a picked edge removes it, with no Shift key.",
   params: { type: "object", properties: { on: { type: "boolean" }, clear: { type: "boolean" } } },
   async run({ on, clear } = {}) {
-    if (clear) { picked = []; await showPicked(); }
+    if (clear) { picked = []; lastRun = null; await showPicked(); }
     if (typeof on === "boolean") {
       pickOn = on;
       if (on && !clear) picked = await selectedEdges();
     }
     return { on: pickOn, count: picked.length };
+  },
+});
+
+// ---- Remove last deburr: delete the toolpaths the last Deburr made, by id, and start over ----
+let lastMade = null;      // { setup, ops: [{id, name}] }
+const opIdOf = (r) => r && (r.id || (typeof r.op === "string" ? r.op : r.op && r.op.id) || (r.operation && r.operation.id)) || null;   // cam.op.* returns { op: "<id>" }
+// The last Deburr's toolpaths that are still in their setup (found by id, or by name if no id).
+async function lastMadeOps() {
+  if (!lastMade) return [];
+  const made = lastMade;
+  let ops = [];
+  try {
+    const r = await run("cam.op.list", { setup: made.setup, compact: true });
+    ops = r.ops || r.operations || (Array.isArray(r) ? r : []);
+  } catch (_) { ops = []; }
+  const left = made.ops.map((m) => ops.find((o) => (m.id && o.id === m.id) || (!m.id && o.name === m.name))).filter(Boolean);
+  if (!left.length && lastMade === made) lastMade = null;
+  return left;
+}
+physcad.commands.register({
+  id: "lastDeburr",
+  title: "Last deburr toolpaths",
+  description: "The toolpaths the last Deburr made that are still in their setup (names), for Remove last deburr.",
+  async run() { return { ops: (await lastMadeOps()).map((o) => o.name) }; },
+});
+physcad.commands.register({
+  id: "removeLastDeburr",
+  title: "Remove last deburr",
+  description: "Delete the toolpaths the last Deburr made (only those), clear the picked edges and forget the problem edges, so edge picking starts over.",
+  async run() {
+    const left = await lastMadeOps();
+    if (!left.length) throw new Error("There is no deburr toolpath to remove.");
+    await run("cam.op.remove", { ops: left.map((o) => o.id) });
+    lastMade = null;
+    lastRun = null;
+    picked = [];
+    try { await run("selection.set", { items: [] }); } catch (_) { /* view may be busy */ }
+    quietKey = null;
+    return { removed: left.map((o) => o.name) };
   },
 });
 

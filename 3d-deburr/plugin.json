@@ -1,7 +1,7 @@
 {
   "id": "com.musiccitymfg.3d-deburr",
   "name": "3D Deburr",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "author": "Music City Mfg",
   "license": "MIT",
   "description": "Finds the sharp outside edges of the part that the tool can reach from above, including wavy and sloped edges, checks that the tool can cut each one cleanly, and adds chamfer toolpaths that break them.",

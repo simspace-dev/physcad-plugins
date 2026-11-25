@@ -1,49 +1,68 @@
 <style>
-  .actions { display: flex; flex-wrap: wrap; gap: 6px; }
-  .actions button { white-space: nowrap; flex: 1 1 auto; }
+  .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .actions + .actions { padding-top: 4px; }   /* PhysCAD's 2px below + 4px = the 6px gap inside a row group */
+  .actions button { white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .prop > label { white-space: normal; text-overflow: clip; line-height: 1.2; }
+  .pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 10px; padding: 0 12px; }
+  .pair > .prop { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 6px; padding: 3px 0; }
+  .pair > .prop > input[type=text] { width: 100%; min-width: 0; box-sizing: border-box; }
+  .checks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 8px; margin: 4px 12px 6px; }
+  .checks label { display: flex; align-items: center; gap: 5px; min-width: 0; line-height: 1.2; cursor: default; }
+  .checks input { flex: none; margin: 0; }
+  .checks label[data-tip] span { text-decoration: underline dotted; text-decoration-color: var(--text-dim); text-underline-offset: 3px; }
   .prop > label[data-tip] { text-decoration: underline dotted; text-decoration-color: var(--text-dim); text-underline-offset: 3px; }
   .cam-warn { margin: 4px 12px 8px; padding: 6px 8px; border-radius: 5px; border: 1px solid var(--warn, #d08a00); color: var(--text); background: color-mix(in srgb, var(--warn, #d08a00) 14%, transparent); }
+  #bar { margin: 8px 12px 2px; height: 5px; border-radius: 3px; overflow: hidden; background: color-mix(in srgb, var(--text-dim) 25%, transparent); }
+  #barFill { height: 100%; width: 0; border-radius: 3px; background: var(--accent, #2f7de1); transition: width .2s; }
+  #bar.unknown #barFill { width: 30%; animation: barSlide 1.1s linear infinite; }
+  @keyframes barSlide { from { margin-left: -30%; } to { margin-left: 100%; } }
   #tip { position: fixed; z-index: 1000; max-width: min(240px, calc(100vw - 16px)); padding: 6px 8px; border-radius: 5px;
          background: var(--panel-solid, #fff); color: var(--text); border: 1px solid var(--panel-border); box-shadow: var(--panel-shadow, 0 4px 14px rgba(0,0,0,.25));
          font-size: 11px; line-height: 1.35; pointer-events: none; opacity: 0; transition: opacity .12s; }
   #tip.show { opacity: 1; }
 </style>
 <p class="cam-warn" id="camWarn" hidden>3D Deburr works in the CAM workspace. Switch to CAM and open a setup to use it.</p>
-<p class="note">Breaks the sharp outside edges you can reach from above in the open setup. Check the result in simulation before cutting.</p>
-<p class="note">For now the break on a wavy or sloped edge is not an even width: the toolpath runs at one depth. An even break is waiting on a PhysCAD feature.</p>
-<div class="prop"><label title="How wide the chamfer is on each edge. Type a unit (e.g. 0.5 mm) to use a different unit than the document.">Width</label><pc-number id="width" kind="length" value="0.25" min="0.01"></pc-number></div>
-<div class="prop"><label title="Split the chamfer into this many cuts, each a little deeper. Use more passes for a wide chamfer or hard material.">Passes</label><pc-number id="passes" kind="count" value="1" min="1" max="10" step="1"></pc-number></div>
-<div class="prop"><label title="How far the cut width on a wavy or sloped edge may differ from Width, in percent, before that edge counts as uneven. Smaller is stricter.">Tolerance %</label><pc-number id="tolerance" kind="count" value="20" min="1" max="500" step="1"></pc-number></div>
-<div class="prop"><label title="Also deburr wavy or sloped edges whose break will not be an even width (outside Tolerance %). The message below gives the widths. Off leaves those edges out. Edges the tool would gouge or collide on are always left out.">Uneven edges</label><input id="keepUneven" type="checkbox" checked></div>
-<div class="prop"><label title="Tool number from your library. Leave blank to use a chamfer mill or spot drill, one this setup already uses if it can. The message below names the tool chosen.">Tool #</label><input id="tool" type="text" size="6" placeholder="auto"></div>
+<p class="note">Breaks sharp outside edges reachable from above. Wavy or sloped edges are cut at one depth for now, so their break is uneven (waiting on PhysCAD). Check in simulation before cutting.</p>
+<div class="pair">
+  <div class="prop"><label title="How wide the chamfer is on each edge. Type a unit (e.g. 0.5 mm) to use a different unit than the document.">Width</label><pc-number id="width" kind="length" value="0.25" min="0.01"></pc-number></div>
+  <div class="prop"><label title="Split the chamfer into this many cuts, each a little deeper. Use more passes for a wide chamfer or hard material.">Passes</label><pc-number id="passes" kind="count" value="1" min="1" max="10" step="1"></pc-number></div>
+</div>
+<div class="pair">
+  <div class="prop"><label title="How far the cut width on a wavy or sloped edge may differ from Width, in percent, before that edge is left out. Smaller is stricter.">Tolerance %</label><pc-number id="tolerance" kind="count" value="20" min="1" max="500" step="1"></pc-number></div>
+  <div class="prop"><label title="Tool number from your library. Leave blank to use a chamfer mill or spot drill, one this setup already uses if it can. The message below names the tool chosen.">Tool #</label><input id="tool" type="text" size="6" placeholder="auto"></div>
+</div>
 
-<p class="note"><b>Auto</b></p>
-<div class="prop"><label title="Only break edges where the two faces meet at least this sharply. 90 = a square corner. Lower finds more edges.">Min angle</label><pc-number id="angle" kind="angle" value="30" min="0" max="179" step="1"></pc-number></div>
-<div class="prop"><label title="Level edges only: how close the side of the tool may come to a wall it isn't chamfering, where an edge runs into a step or boss. 0 lets it touch.">Wall clear</label><pc-number id="wallClear" kind="length" value="0" min="0"></pc-number></div>
-<div class="prop"><label title="Leave out edges that already have a small chamfer or round drawn on the model.">Skip chamfered</label><input id="skipModeled" type="checkbox" checked></div>
-<div class="prop"><label title="Leave out the edges of holes whose size is between Hole min and Hole max (e.g. tapped holes).">Skip holes</label><input id="skipHoles" type="checkbox"></div>
-<div class="prop"><label title="Smallest hole size to skip. You can type a unit, e.g. 6.5 mm.">Hole min</label><pc-number id="holeMin" kind="length" value="0" min="0"></pc-number></div>
-<div class="prop"><label title="Largest hole size to skip. You can type a unit, e.g. 8 mm.">Hole max</label><pc-number id="holeMax" kind="length" value="10" min="0"></pc-number></div>
+<p class="note"><b>Which edges:</b> every sharp edge, unless you pick some.</p>
+<div class="pair">
+  <div class="prop"><label title="Only break edges where the two faces meet at least this sharply. 90 = a square corner. Lower finds more edges.">Min angle</label><pc-number id="angle" kind="angle" value="30" min="0" max="179" step="1"></pc-number></div>
+  <div class="prop"><label title="Level edges only: how close the side of the tool may come to a wall it isn't chamfering, where an edge runs into a step or boss. 0 lets it touch.">Wall clear</label><pc-number id="wallClear" kind="length" value="0" min="0"></pc-number></div>
+</div>
+<div class="pair">
+  <div class="prop"><label title="Smallest hole size to skip. You can type a unit, e.g. 6.5 mm.">Hole min</label><pc-number id="holeMin" kind="length" value="0" min="0"></pc-number></div>
+  <div class="prop"><label title="Largest hole size to skip. 0 means any size. You can type a unit, e.g. 8 mm.">Hole max</label><pc-number id="holeMax" kind="length" value="10" min="0"></pc-number></div>
+</div>
+<div class="checks">
+  <label title="Leave out edges that already have a small chamfer or round drawn on the model."><input id="skipModeled" type="checkbox" checked><span>Skip chamfered</span></label>
+  <label title="Leave out the edges of holes whose size is between Hole min and Hole max (e.g. tapped holes). With Hole max at 0, every hole from Hole min up is left out."><input id="skipHoles" type="checkbox"><span>Skip holes</span></label>
+</div>
 <div class="actions">
-  <button id="exclude" title="Click edges on the part, then press this. Find edges and Create deburr will leave them out. Saved with this document.">Exclude picked</button>
+  <button id="exclude" title="Click edges on the part, then press this. They are left out whenever the plugin finds the edges itself. Saved with this document.">Exclude picked</button>
   <button id="clear" title="Forget all the edges you excluded in this document.">Clear excluded</button>
 </div>
 <p class="note" id="excludedNote"></p>
-<div class="actions">
-  <button id="find" title="Highlight the edges that would be deburred, without making a toolpath.">Find edges</button>
-  <button id="leftOut" title="Highlight the edges the last search left out: ones the tool can't cut cleanly, or that are sharp along only part of their length.">Show left out</button>
-  <button class="primary" id="make" title="Make the toolpaths for all the edges Find edges shows: a chamfer toolpath for level edges and a Path toolpath for wavy or sloped ones.">Create deburr</button>
-</div>
-
-<p class="note"><b>Wavy or 3D edges:</b> pick them on the part, then:</p>
+<p class="note">To deburr only some edges, pick them on the part. With none picked, every sharp edge is deburred.</p>
 <div class="actions">
   <button id="pickMode" title="While on, each click adds an edge to your picks and clicking a picked edge removes it. No Shift key needed.">Pick mode: off</button>
   <button id="pickClear" title="Unpick all edges.">Clear picks</button>
 </div>
-<p class="note">Pick mode on: click edges to add them, click a picked edge to remove it. No Shift key needed.</p>
-<div class="actions"><button class="primary" id="picked" title="Make a toolpath that follows the edges you picked, even wavy 3D ones. Every picked edge is cut. The message below lists the ones with a problem: an uneven break, or the tool cutting into or hitting the part. Check those in simulation.">Deburr selected edges</button></div>
+<div class="actions">
+  <button class="primary" id="make" title="Makes the deburr toolpaths. With no edges picked: finds every sharp outside edge on the part and deburrs them all. With edges picked: deburrs exactly those, every one of them. Level edges get a chamfer toolpath, wavy or sloped ones a Path toolpath.">Deburr all edges</button>
+  <button id="find" title="Optional. Highlights the edges Deburr all edges would cut, without making a toolpath. Off while you have edges picked.">Preview</button>
+  <button id="leftOut" disabled title="On only after a Preview or Deburr that found edges with a problem: ones the tool can't cut cleanly, or that are sharp along only part of their length. Highlights those edges on the part (this replaces your picks).">Show problem edges</button>
+  <button id="removeLast" disabled title="On only after a Deburr. Deletes the toolpaths that Deburr made (nothing else), clears your picked edges and resets the panel, so you can pick edges again.">Remove last deburr</button>
+</div>
 
+<div id="bar" hidden><div id="barFill"></div></div>
 <p class="note" id="status"></p>
 <div id="tip"></div>
 <script src="panel.js"></script>

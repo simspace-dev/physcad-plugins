@@ -1,5 +1,24 @@
 # Changelog
 
+## 3d-deburr 0.6.6 (2026-11-25)
+
+The plugin is now built as if PhysCAD could already follow the tool path it works out, so it is ready the day PhysCAD adds that. For every wavy or sloped edge it works out where the tool must be at each point to cut a break of one even width, and checks the edge on that path: whether the tool fits, whether it would hit a nearby face, and now also whether the tool's shank or holder would hit the part. Sharp corners partway along an edge are handled too. Edges that even that path could not cut cleanly are left out. The toolpath it actually makes is still a stand-in at one depth, because that is all PhysCAD can follow today, so the break on wavy edges stays uneven until PhysCAD's update.
+
+The panel is simpler. One Deburr button does the work: with no edges picked it finds and deburrs every sharp edge, and with edges picked it deburrs exactly those. Its label says which. Preview shows the edges without making a toolpath. Show problem edges lights up only while the last run's problem edges still apply, and greys out the moment anything changes (a setting, your picks, the part, the setup or the document). A new Remove last deburr button deletes only the toolpaths the last Deburr made and clears your picks, so you can start over. The panel is also shorter: fields sit two per row, the checkboxes share a row, all buttons are the same width, and a progress bar shows while the plugin works.
+
+- One action, `deburr()` (command `createDeburr`): picked edges are all cut and the ones with a problem are listed; with none picked it finds every edge itself. `deburrSelected` is the same but needs picks. The Deburr selected edges button, the Uneven edges checkbox and `keepUneven` / `keepFlagged` are gone.
+- Edges the plugin highlighted, or just made a toolpath on, do not count as picks (`quietKey`), so Deburr cannot make a second toolpath on them.
+- Even-width tool positions: `tipOffsets` (pointed tools, with an optional `flank` shift, and ball end mills) replaces `evenDepths`. `cutCheck` checks those positions (`checkEven`), with the edge's own direction between samples (`offsetAlong`). `PATH_POINTS` (false for now) will pass them to `cam.op.trace` as `points` chains (`chainOf`).
+- Sharp corners inside an edge: the edge is read every 0.25 mm, corners (a turn of more than 12°) are found, and nothing is blended across one. Pocket rim corner: 0.242–0.255 mm with the chamfer mill, was 0.23–0.41.
+- Holder and shank check: `toolShape` builds the whole tool (flutes, body, shank, holder rings) and `nearFaceHits` checks all of it. A hit above the flutes is reason `shank`.
+- Dev commands `tipPath` and `evenDepth` (flank and ball tools) return the tool path in the shape asked of PhysCAD.
+- Show problem edges: main.js keeps the record (`lastRun`); it is forgotten when the document, setup, part shape or picks change, a setting is edited, Clear picks or Clear excluded is pressed, or a new run starts. New commands `problemCount` and `forgetProblems`.
+- Remove last deburr: new commands `removeLastDeburr` and `lastDeburr`. Deletes the last Deburr's toolpaths by id, clears picks and problem edges. The button is on only while those toolpaths exist.
+- Every PhysCAD request now goes one at a time, even when the panel's background checks run during a Deburr. Once a toolpath is made, nothing after it can turn the run into an error. (Once, Deburr made its toolpath but still reported "PhysCAD couldn't finish"; the cause was not found and it could not be repeated.)
+- Progress: PhysCAD's own bar (with Cancel) plus a bar in the panel.
+- Hole max 0 now means any size.
+- Tested in PhysCAD on the wavy test part: all six top edges pass on the even-width path (0.242–0.261 mm asked 0.25); problem-edge count and its reset on a setting change and on a new pick; Deburr then Remove last deburr, twice, leaving the setup as it was. Not seen on screen yet: the panel itself.
+
 ## 3d-deburr 0.6.5 (2026-11-25)
 
 The plugin now recovers by itself when PhysCAD's modeling engine stops. The modeling engine is the part of PhysCAD that does the geometry math. During testing it stopped once in the middle of a search and restarted itself; nothing in the file was lost, but the search ended with an error and had to be run again by hand. The cause is not known, and it happened once in about eight searches.

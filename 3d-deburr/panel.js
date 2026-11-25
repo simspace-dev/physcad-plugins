@@ -11,10 +11,9 @@ physcad.storage.get("panel").then((v) => {
   if (typeof v.tool === "string") tool.value = v.tool;
   if (typeof v.skipModeled === "boolean") skipModeled.checked = v.skipModeled;
   if (typeof v.skipHoles === "boolean") skipHoles.checked = v.skipHoles;
-  if (typeof v.keepUneven === "boolean") $("keepUneven").checked = v.keepUneven;
 });
 function save() {
-  const v = { tool: tool.value, skipModeled: skipModeled.checked, skipHoles: skipHoles.checked, keepUneven: $("keepUneven").checked };
+  const v = { tool: tool.value, skipModeled: skipModeled.checked, skipHoles: skipHoles.checked };
   for (const k of SAVED) v[k] = Number($(k).value);
   return physcad.storage.set("panel", v);
 }
@@ -32,7 +31,6 @@ const findOpts = () => ({
   skipHoles: skipHoles.checked,
   holeMin: Number(holeMin.value),
   holeMax: Number(holeMax.value),
-  keepUneven: $("keepUneven").checked,
 });
 
 // A length in the document's units (the plugin works in mm).
@@ -40,21 +38,19 @@ const fmt = (mm, units) => (units === "in" ? `${(mm / 25.4).toFixed(4)} in` : `$
 function checkText(r) {
   return r.check && r.check !== "on" ? ` 3D edge check ${r.check}.` : "";
 }
-// The cut widths of the 3D edges kept and of the ones left out.
+// The break the 3D edges are planned to get, and what they get until PhysCAD can follow that plan.
 function widthText(r) {
-  const span = (list) => {
-    const w = list.map((e) => e.cutWidth).filter(Boolean);
-    return w.length ? `${fmt(Math.min(...w.map((x) => x[0])), r.units)} to ${fmt(Math.max(...w.map((x) => x[1])), r.units)}` : "";
-  };
-  const wavy = (r.edges || []).filter((e) => e.kind !== "level");
-  const kept = span(wavy.filter((e) => !e.uneven)), rough = span(wavy.filter((e) => e.uneven)), left = span(r.flagged || []);
-  return (kept ? ` Even 3D edges cut ${kept} wide.` : "")
-    + (rough ? ` ${r.uneven} uneven 3D edges cut ${rough} wide (you asked for ${fmt(r.width, r.units)}).` : "")
-    + (left ? ` The left-out ones would cut ${left} wide.` : "");
+  const w = (r.edges || []).filter((e) => e.kind !== "level").map((e) => e.cutWidth).filter(Boolean);
+  if (!w.length) return "";
+  const plan = ` Wavy edges: break planned ${fmt(Math.min(...w.map((x) => x[0])), r.units)} to ${fmt(Math.max(...w.map((x) => x[1])), r.units)} wide.`;
+  return plan + (r.standIn ? " Until PhysCAD's update they are cut at one depth, so the break is uneven." : "");
 }
+// Edges with a problem: left out when the plugin found the edges, cut anyway when you picked them.
 function leftOutText(r) {
-  const n = (r.flagged || []).length + (r.partial || []).length;
-  return n ? ` ${n} left out or only partly sharp: press Show left out to see them.` : "";
+  const flagged = r.flagged || [], n = flagged.length + (r.partial || []).length;
+  if (!n) return "";
+  if (r.mode === "picked") return ` ${n} picked edges have a problem (cut anyway): ${[...new Set(flagged.map((f) => f.reason))].join("; ")}. Press Show problem edges to see them.`;
+  return ` ${n} left out or only partly sharp: press Show problem edges to see them.`;
 }
 function skippedText(s) {
   const parts = Object.entries(s || {}).map(([k, n]) => `${n} ${k}`);
@@ -68,43 +64,114 @@ async function showExcluded() {
   } catch (_) { excludedNote.textContent = ""; }
 }
 
+// The progress bar: sliding while nothing is known, then filled as main.js reports each edge.
+const bar = $("bar"), barFill = $("barFill");
+let working = false;
+function showProgress(p) {
+  if (!working || !p) return;
+  const known = typeof p.fraction === "number";
+  bar.classList.toggle("unknown", !known);
+  barFill.style.width = known ? `${Math.round(Math.max(0, Math.min(1, p.fraction)) * 100)}%` : "";
+  if (p.text) status.textContent = `${p.text}…`;
+}
+if (physcad.onMessage) physcad.onMessage((data) => showProgress(data && data.progress));   // sent by main.js
+
 async function busy(btn, fn) {
   btn.disabled = true;
-  status.textContent = "Working… checking wavy edges can take a minute.";
-  try { await save(); await fn(); }
+  working = true;
+  bar.hidden = false; bar.classList.add("unknown"); barFill.style.width = "";
+  status.textContent = "Working…";
+  try { await queue; await save(); await fn(); }   // let a background question finish first
   catch (e) { status.textContent = e.message; await physcad.ui.toast(e.message, "error"); }
-  finally { btn.disabled = false; }
+  finally {
+    working = false; bar.hidden = true;
+    if (btn !== removeBtn) btn.disabled = false;   // Remove last deburr: showRemove decides
+    await showPicks();
+    await showRemove();
+  }
 }
+
+// One button does the deburring: all edges when none are picked, the picked ones when some are.
+// Its label says which. Preview shows the automatic set, so it is off while edges are picked.
+const makeBtn = $("make"), findBtn = $("find");
+// Background questions to the plugin go one at a time (larger, parallel requests stopped
+// PhysCAD's modeling engine once).
+let queue = Promise.resolve();
+function ask(id, args = {}) {
+  const next = queue.then(() => physcad.commands.run(id, args));
+  queue = next.catch(() => {});
+  return next;
+}
+async function showPicks() {
+  if (working) return;
+  let n = 0;
+  try { n = (await ask("selectedCount")).count || 0; } catch (_) { /* treat as none */ }
+  if (working) return;
+  makeBtn.textContent = n ? `Deburr ${n} picked edge${n === 1 ? "" : "s"}` : "Deburr all edges";
+  findBtn.disabled = n > 0;
+  await showProblems(false);
+}
+// The problem-edges button is only on while the last Preview or Deburr's problem edges still
+// apply, and says how many. The plugin keeps that record and forgets it when the document, setup,
+// part or picks change; deep also checks the part's shape.
+const problemBtn = $("leftOut");
+async function showProblems(deep) {
+  if (working) return;
+  let n = 0;
+  try { n = (await ask("problemCount", { deep })).count || 0; } catch (_) { /* treat as none */ }
+  if (working) return;
+  problemBtn.disabled = !n;
+  problemBtn.textContent = n ? `Show ${n} problem edge${n === 1 ? "" : "s"}` : "Show problem edges";
+}
+// Remove last deburr is only on while the last Deburr's toolpaths are still in their setup.
+const removeBtn = $("removeLast");
+async function showRemove() {
+  if (working) return;
+  let ops = [];
+  try { ops = (await ask("lastDeburr")).ops || []; } catch (_) { /* treat as none */ }
+  if (working) return;
+  removeBtn.disabled = !ops.length;
+}
+// Any setting changed: the last run's problem edges may no longer be right.
+function settingChanged(e) {
+  if (!e.target.closest || !e.target.closest(".prop, .checks")) return;
+  ask("forgetProblems").catch(() => {});
+  problemBtn.disabled = true;
+  problemBtn.textContent = "Show problem edges";
+}
+document.addEventListener("input", settingChanged);
+document.addEventListener("change", settingChanged);
+physcad.events.on("selectionChanged", showPicks);
+showPicks();
 
 $("find").addEventListener("click", () => busy($("find"), async () => {
   const r = await physcad.commands.run("findEdges", { ...findOpts(), ...toolOpts() });
   showCam(r.inCam);
   const wavy = r.edges.filter((e) => e.kind === "3d").length;
-  status.textContent = `${r.edges.length} edges to deburr (${r.edges.length - wavy} level, ${wavy} 3D)` + (r.tool ? ` with ${r.tool}` : "") + (r.inCam ? " (highlighted)." : ". Switch to CAM to see them highlighted.") + widthText(r) + skippedText(r.skipped) + leftOutText(r) + checkText(r);
+  status.textContent = `${r.edges.length} edges to deburr (${r.edges.length - wavy} level, ${wavy} wavy)` + (r.tool ? ` with ${r.tool}` : "") + (r.inCam ? " (highlighted)." : ". Switch to CAM to see them highlighted.") + widthText(r) + skippedText(r.skipped) + leftOutText(r) + checkText(r);
 }));
 
 $("make").addEventListener("click", () => busy($("make"), async () => {
   const r = await physcad.commands.run("createDeburr", { ...findOpts(), ...common(), wallClear: Number($("wallClear").value) });
   status.textContent = `Made ${r.ops.map((o) => `${o.name} on ${o.edgeCount} edges`).join(" and ")} with ${r.tool}.` + widthText(r) + skippedText(r.skipped) + leftOutText(r);
+  removeBtn.disabled = false;
 }));
 
-$("picked").addEventListener("click", () => busy($("picked"), async () => {
-  const r = await physcad.commands.run("deburrSelected", common());
-  const why = [...new Set((r.flagged || []).map((f) => f.reason))].join("; ");
-  const n = (r.flagged || []).length;
-  const left = !why ? "" : r.keptFlagged ? ` ${n} of them have a problem: ${why}. Show left out highlights them.` : ` Left out ${n}: ${why}. Press Show left out to see them.`;
-  status.textContent = `Made ${r.name} on ${r.edgeCount} picked edges with ${r.tool}.${left} Check it in simulation before cutting.`;
+removeBtn.addEventListener("click", () => busy(removeBtn, async () => {
+  const r = await physcad.commands.run("removeLastDeburr", {});
+  removeBtn.disabled = true;
+  status.textContent = `Removed ${r.removed.join(" and ")}. Picks cleared: pick edges again, or press Deburr all edges.`;
 }));
 
 $("leftOut").addEventListener("click", () => busy($("leftOut"), async () => {
   const r = await physcad.commands.run("showLeftOut", {});
-  status.textContent = r.count ? `${r.count} left-out edges highlighted.` : "Nothing was left out by the last search.";
+  status.textContent = r.count ? `${r.count} edges with a problem highlighted.` : "Something changed since the last run (the part, setup or picks). Run Preview or Deburr again.";
 }));
 
 $("exclude").addEventListener("click", () => busy($("exclude"), async () => {
   await physcad.commands.run("excludeSelected", {});
   await showExcluded();
-  status.textContent = "Those edges will be left out of Find edges and Create deburr.";
+  status.textContent = "Those edges will be left out whenever the plugin finds the edges itself.";
 }));
 
 $("clear").addEventListener("click", () => busy($("clear"), async () => {
@@ -125,12 +192,13 @@ pickBtn.addEventListener("click", () => busy(pickBtn, async () => {
   status.textContent = r.on ? "Pick mode on. Click edges to add or remove them." : "Pick mode off.";
 }));
 $("pickClear").addEventListener("click", () => busy($("pickClear"), async () => {
-  showPick(await physcad.commands.run("pickMode", { clear: true }));
+  showPick(await physcad.commands.run("pickMode", { clear: true }));   // also forgets the problem edges
   status.textContent = "Picks cleared.";
 }));
 physcad.commands.run("pickMode", {}).then(showPick).catch(() => {});
 
-physcad.events.on("documentOpened", showExcluded);
+physcad.events.on("documentOpened", () => { showExcluded(); showPicks(); showRemove(); });
+showRemove();
 showExcluded();
 
 // Tooltips: our own, so the delay is ours (the system one waits about 1 s).
@@ -164,8 +232,15 @@ document.addEventListener("mouseleave", hideTip);
 // event when the workspace changes, so check every couple of seconds.
 const camWarn = $("camWarn");
 function showCam(on) { camWarn.hidden = !!on; }
+// The same check also sees a part edit or a setup change, so the problem-edges button greys out.
+let checking = false;
 async function checkCam() {
-  try { showCam((await physcad.commands.run("workspace", {})).inCam); } catch (_) { /* leave as is */ }
+  if (working || checking) return;
+  checking = true;
+  try { showCam((await ask("workspace")).inCam); } catch (_) { /* leave as is */ }
+  if (!problemBtn.disabled) await showProblems(true);
+  if (!removeBtn.disabled) await showRemove();   // its toolpaths deleted by hand: grey it out
+  checking = false;
 }
 checkCam();
 setInterval(checkCam, 2000);
